@@ -215,6 +215,10 @@ const deviceAuth = wrap(async (req, res, next) => {
   } else if (!d.secret) {
     await devices.updateOne({ serial, $or: [{ secret: null }, { secret: { $exists: false } }] }, { $set: { secret: key } });
     d = await devices.findOne({ serial });
+  } else if (!d.owner && !safeEq(d.secret, key)) {
+    // Equipo sin dueño (desvinculado o restablecido de fábrica): acepta su clave nueva.
+    await devices.updateOne({ serial, owner: null }, { $set: { secret: key } });
+    d = await devices.findOne({ serial });
   }
   if (!d || !d.secret || !safeEq(d.secret, key)) return res.status(403).type('text').send('FORBIDDEN\n');
   req.dev = d; next();
@@ -255,6 +259,17 @@ app.post('/api/device/poll', deviceAuth, wrap(async (req, res) => {
   if (push) out += 'PUSHED\n';
   for (const c of (nd.cmds || []).slice(0, 4)) out += `CMD|${c.id}|${c.cmd}\n`;
   res.type('text').send(out);
+}));
+
+// El equipo pide desvincularse (al restablecer de fábrica): queda libre para otra cuenta.
+app.post('/api/device/unlink', deviceAuth, wrap(async (req, res) => {
+  const d = req.dev;
+  if (d.owner) {
+    await devices.updateOne({ serial: d.serial, owner: d.owner },
+      { $set: { owner: null, label: '', ...blank(), exp: new Date(Date.now() + UNCL_TTL) } });
+    await events.deleteMany({ serial: d.serial });
+  }
+  res.type('text').send('OK\n');
 }));
 
 app.get('/api/device/db', deviceAuth, (req, res) => {
