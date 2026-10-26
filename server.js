@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
+const { EventEmitter } = require('events');
 
 const { MONGODB_URI, JWT_SECRET } = process.env;
 const DB_NAME = process.env.DB_NAME || 'daltec_db';
@@ -17,6 +18,8 @@ const ONLINE_MS = 45000;
 const UNCL_TTL = 7 * 864e5;
 
 let users, devices, events;
+let ready = false;                       // la base de datos aún no está lista -> 503 rápido (en vez de dejar la petición colgada)
+const wake = new EventEmitter(); wake.setMaxListeners(0);   // despierta los sondeos largos de un equipo cuando hay una orden o una edición
 const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -27,6 +30,10 @@ app.use((req, res, next) => {
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS', 'Access-Control-Max-Age': '86400' });
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
+});
+app.use((req, res, next) => {
+  if (ready || req.path === '/healthz' || req.path === '/') return next();
+  res.status(503).set('Retry-After', '3').type('text').send('STARTING\n');
 });
 app.use(express.urlencoded({ extended: false, limit: '16kb' }));
 app.use(express.json({ limit: '16kb' }));
@@ -41,7 +48,7 @@ const sha = s => crypto.createHash('sha256').update(String(s)).digest();
 const safeEq = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
 const nowS = () => Math.floor(Date.now() / 1000);
 const fnu = async (p) => { const r = await p; return r && Object.prototype.hasOwnProperty.call(r, 'value') && r.ok !== undefined ? r.value : r; };
-const blank = () => ({ rev: 0, people: [], groups: [], scheds: [], cmds: [], mode: 0, relay: 0, ip: '', rssi: 0, fw: '', lastSeen: null, lastCard: 0, devTs: 0, devName: '', slave: null, lectorSeen: null, backupAt: 0 });
+const blank = () => ({ rev: 0, people: [], groups: [], scheds: [], cmds: [], mode: 0, relay: 0, ip: '', rssi: 0, fw: '', lastSeen: null, lastCard: 0, devTs: 0, devName: '' });
 
 // ---------- usuarios ----------
 const tries = new Map();
@@ -90,10 +97,6 @@ app.post('/api/devices', needUser, wrap(async (req, res) => {
   const model = clean(req.body.model, 20), serial = clean(req.body.serial, 20).toUpperCase(), name = clean(req.body.name);
   if (!MODELS.includes(model)) return fail(res, 400, 'Modelo no soportado');
   if (!SERIAL_RE.test(serial)) return fail(res, 400, 'Número de serie no válido (DAL-######## o DAL-L########)');
-  if (/^DAL-\d{8}$/.test(serial)) {   // relé: si ya es esclavo de un lector no se registra por separado
-    const m = await devices.findOne({ 'slave.serial': serial, owner: { $ne: null } });
-    if (m) return fail(res, 409, 'Ese relé es esclavo del lector ' + m.serial + '; se gestiona desde el lector');
-  }
   try {
     await devices.findOneAndUpdate({ serial, owner: null },
       { $set: { owner: req.uid, model, label: name || serial, claimedAt: new Date() }, $unset: { exp: '' }, $setOnInsert: { secret: null, ...blank() } },
@@ -128,16 +131,15 @@ app.use('/api/d/:serial', needUser, own, R);
 R.get('/status', (req, res) => {
   const d = req.dev;
   res.json({ serial: d.serial, model: d.model, name: d.label || d.devName || d.serial, mode: d.mode, relay: d.relay, ip: d.ip, rssi: d.rssi, fw: d.fw,
-    online: !!isOnline(d), lastSeen: d.lastSeen ? Math.floor(new Date(d.lastSeen).getTime() / 1000) : 0, lastCard: d.lastCard || 0, time: d.devTs || 0, rev: d.rev,
-    slave: d.slave ? { serial: d.slave.serial, link: d.slave.link, chan: d.slave.chan, seen: d.slave.at ? Math.floor(new Date(d.slave.at).getTime() / 1000) : 0 } : null,
-    viaBackup: !!(d.backupAt && Date.now() - d.backupAt < ONLINE_MS && !(d.lectorSeen && Date.now() - new Date(d.lectorSeen).getTime() < ONLINE_MS)) });
+    online: !!isOnline(d), lastSeen: d.lastSeen ? Math.floor(new Date(d.lastSeen).getTime() / 1000) : 0, lastCard: d.lastCard || 0, time: d.devTs || 0, rev: d.rev, pending: (d.cmds || []).length });
 });
 R.post('/door', wrap(async (req, res) => {
   const cmd = String(req.body.cmd || '');
   if (!['pulse', 'open', 'closed', 'auto'].includes(cmd)) return fail(res, 400, 'Comando inválido');
   const id = crypto.randomInt(1, 2e9);
   await devices.updateOne({ serial: req.dev.serial }, { $push: { cmds: { $each: [{ id, cmd, at: Date.now() }], $slice: -8 } } });
-  res.json({ ok: true });
+  wake.emit(req.dev.serial);   // si el equipo tiene un sondeo largo abierto, recibe la orden al instante
+  res.json({ ok: true, online: !!isOnline(req.dev) });
 }));
 R.get('/list', (req, res) => {
   const d = req.dev, t = req.query.t;
@@ -159,7 +161,7 @@ async function mutate(serial, fn) {
     const nd = { people: d.people.map(x => ({ ...x })), groups: d.groups.map(x => ({ ...x })), scheds: d.scheds.map(x => ({ ...x })) };
     const out = fn(nd);
     const r = await devices.updateOne({ serial, rev: d.rev }, { $set: nd, $inc: { rev: 1 } });
-    if (r.matchedCount) return out;
+    if (r.matchedCount) { wake.emit(serial); return out; }
   }
   throw Object.assign(new Error('Conflicto de edición, intenta de nuevo'), { http: 409 });
 }
@@ -227,7 +229,7 @@ const deviceAuth = wrap(async (req, res, next) => {
     d = await devices.findOne({ serial });
   }
   if (!d || !d.secret || !safeEq(d.secret, key)) return res.status(403).type('text').send('FORBIDDEN\n');
-  req.dev = d; req.backup = req.get('X-Role') === 'backup' && model === 'DAL-LECTOR'; next();
+  req.dev = d; next();
 });
 const lines = body => String(body || '').split('\n').map(l => l.replace(/\r$/, '')).filter(Boolean).map(l => l.split('|'));
 
@@ -241,17 +243,29 @@ function parseSnapshot(ls) {
   return o;
 }
 
+// Espera hasta 'ms' a que haya algo para el equipo. Devuelve el documento actualizado, o null si el equipo cortó la conexión.
+function waitChange(serial, ms, base, res) {
+  return new Promise((resolve, reject) => {
+    let fin = false, t1, t2;
+    const end = async alive => {
+      if (fin) return; fin = true; clearTimeout(t1); clearInterval(t2); wake.off(serial, onWake); res.off('close', onClose);
+      if (!alive) return resolve(null);
+      try { resolve(await devices.findOne({ serial })); } catch (e) { reject(e); }
+    };
+    const onWake = () => end(true);
+    const onClose = () => { if (!res.writableEnded) end(false); };
+    wake.on(serial, onWake); res.on('close', onClose);
+    t1 = setTimeout(() => end(true), ms);
+    t2 = setInterval(async () => {                      // respaldo por si la orden la atendió otra instancia del servidor: revisa la base cada 4 s
+      try { const x = await devices.findOne({ serial }, { projection: { cmds: 1, rev: 1, owner: 1 } }); if (x && (!x.owner || (x.cmds || []).length || x.rev !== base.rev)) end(true); } catch (e) { /* se reintenta */ }
+    }, 4000);
+  });
+}
 app.post('/api/device/poll', deviceAuth, wrap(async (req, res) => {
   const d = req.dev, ls = lines(req.body), H = ls.find(f => f[0] === 'H') || [];
   const txt = s => clean(s, 40);
-  const bk = !!req.backup;   // el relé en respaldo habla con la identidad del lector, pero NO es maestro: no toca IP, nombre, FW ni datos
-  const base = { lastSeen: new Date(), mode: Math.min(2, Math.max(0, int(H[3], 0))), relay: int(H[4], 0) ? 1 : 0 };
-  const set = bk ? { ...base, backupAt: Date.now() }
-    : { ...base, lectorSeen: new Date(), ip: txt(H[5]), rssi: int(H[6], 0), fw: txt(H[7]), devTs: int(H[8], 0), lastCard: Math.max(0, Number(H[9]) || 0), devName: txt(H[10]) };
-  if (!bk) {   // dispositivo esclavo: lo reporta el lector (línea L|serie|enlace|canal|segundos); solo lectura en la nube
-    const L = ls.find(f => f[0] === 'L');
-    set.slave = L && /^DAL-\d{8}$/.test(L[1] || '') ? { serial: L[1], link: int(L[2], 0) === 1 ? 1 : 2, chan: Math.min(14, Math.max(0, int(L[3], 0))), age: Math.max(0, int(L[4], 0)), at: new Date() } : null;
-  }
+  const set = { lastSeen: new Date(), mode: Math.min(2, Math.max(0, int(H[3], 0))), relay: int(H[4], 0) ? 1 : 0, ip: txt(H[5]), rssi: int(H[6], 0), fw: txt(H[7]),
+    devTs: int(H[8], 0), lastCard: Math.max(0, Number(H[9]) || 0), devName: txt(H[10]) };
   if (!d.owner) {
     await devices.updateOne({ serial: d.serial }, { $set: { ...set, exp: new Date(Date.now() + UNCL_TTL) } });
     return res.type('text').send('UNCLAIMED\n');
@@ -263,19 +277,27 @@ app.post('/api/device/poll', deviceAuth, wrap(async (req, res) => {
   if (evs.length) { try { await events.insertMany(evs, { ordered: false }); } catch (e) { if (e.code !== 11000 && !(e.writeErrors || []).every(w => w.code === 11000)) throw e; } }
   const acks = ls.filter(f => f[0] === 'K').map(f => int(f[1], -1));
   const upd = { $set: set, $pull: { cmds: { $or: [{ id: { $in: acks } }, { at: { $lt: Date.now() - 6e5 } }] } } };
-  const push = !bk && int(H[2], 0) === 1;   // el respaldo nunca sube ni sobrescribe personas/horarios
+  const push = int(H[2], 0) === 1;
   if (push) Object.assign(upd.$set, parseSnapshot(ls)), upd.$inc = { rev: 1 };
   const nd = await fnu(devices.findOneAndUpdate({ serial: d.serial, owner: d.owner }, upd, { returnDocument: 'after' }));
   if (!nd) return res.type('text').send('UNCLAIMED\n');
-  let out = `OK|${nd.rev}|${nowS()}\n`;
+  // Sondeo largo (?wait=N): si no hay nada que entregar, se retiene la petición hasta N s (máx. 20) y se responde AL INSTANTE cuando llega
+  // una orden o una edición desde la web. Sin ?wait responde de inmediato (el relé en modo respaldo y firmwares viejos siguen igual).
+  let cur = nd;
+  const waitS = Math.min(20, Math.max(0, int(req.query.wait, 0)));
+  if (waitS && !push && !(nd.cmds || []).length && int(H[1], -1) === nd.rev) {
+    cur = await waitChange(d.serial, waitS * 1000, nd, res);
+    if (!cur) return;                                   // el equipo cortó la conexión
+    if (!cur.owner) return res.type('text').send('UNCLAIMED\n');
+  }
+  let out = `OK|${cur.rev}|${nowS()}\n`;
   if (push) out += 'PUSHED\n';
-  for (const c of (nd.cmds || []).slice(0, 4)) out += `CMD|${c.id}|${c.cmd}\n`;
+  for (const c of (cur.cmds || []).slice(0, 4)) out += `CMD|${c.id}|${c.cmd}\n`;
   res.type('text').send(out);
 }));
 
 // El equipo pide desvincularse (al restablecer de fábrica): queda libre para otra cuenta.
 app.post('/api/device/unlink', deviceAuth, wrap(async (req, res) => {
-  if (req.backup) return res.status(403).type('text').send('FORBIDDEN\n');
   const d = req.dev;
   if (d.owner) {
     await devices.updateOne({ serial: d.serial, owner: d.owner },
@@ -305,16 +327,30 @@ app.use((err, req, res, next) => {
   fail(res, 500, 'Error del servidor');
 });
 
-(async () => {
-  const client = new MongoClient(MONGODB_URI);
-  await client.connect();
-  const db = client.db(DB_NAME);
-  users = db.collection('users'); devices = db.collection('devices'); events = db.collection('events');
-  await users.createIndex({ email: 1 }, { unique: true });
-  await devices.createIndex({ serial: 1 }, { unique: true });
-  await devices.createIndex({ owner: 1 });
-  await devices.createIndex({ exp: 1 }, { expireAfterSeconds: 0 });
-  await events.createIndex({ serial: 1, boot: 1, seq: 1 }, { unique: true });
-  await events.createIndex({ rcv: 1 }, { expireAfterSeconds: 90 * 86400 });
-  app.listen(PORT, '0.0.0.0', () => console.log(`Daltec nube en :${PORT} (db ${DB_NAME})`));
-})().catch(e => { console.error('Fallo al iniciar:', e.message); process.exit(1); });
+// Se escucha YA (Render ve el puerto abierto en segundos y el equipo recibe 503 rápido en vez de una petición colgada) y la base se conecta en segundo plano.
+const srv = app.listen(PORT, '0.0.0.0', () => console.log(`Daltec nube escuchando en :${PORT} (db ${DB_NAME})`));
+srv.keepAliveTimeout = 65000; srv.headersTimeout = 66000;   // mayores que los del proxy de Render (evita 502 por conexiones reutilizadas)
+(async function boot() {
+  for (;;) {
+    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
+    try {
+      await client.connect();
+      const db = client.db(DB_NAME);
+      users = db.collection('users'); devices = db.collection('devices'); events = db.collection('events');
+      await Promise.all([
+        users.createIndex({ email: 1 }, { unique: true }),
+        devices.createIndex({ serial: 1 }, { unique: true }),
+        devices.createIndex({ owner: 1 }),
+        devices.createIndex({ exp: 1 }, { expireAfterSeconds: 0 }),
+        events.createIndex({ serial: 1, boot: 1, seq: 1 }, { unique: true }),
+        events.createIndex({ rcv: 1 }, { expireAfterSeconds: 90 * 86400 })
+      ]);
+      ready = true; console.log('Base de datos lista');
+      return;
+    } catch (e) {
+      console.error('Fallo al conectar la base:', e.message, '- reintento en 5 s');
+      client.close().catch(() => {});
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+})();
