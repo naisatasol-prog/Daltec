@@ -10,8 +10,8 @@ const DB_NAME = process.env.DB_NAME || 'daltec_db';
 const PORT = Number(process.env.PORT) || 3000;   // Render asigna el puerto en PORT
 if (!MONGODB_URI || !JWT_SECRET) { console.error('Faltan MONGODB_URI o JWT_SECRET'); process.exit(1); }
 
-const MODELS = ['DAL-1P-EX'];
-const SERIAL_RE = /^DAL-\d{8}$/;
+const MODELS = ['DAL-1P-EX', 'DAL-LECTOR'];
+const SERIAL_RE = /^DAL-(\d{8}|L[0-9A-F]{8})$/;   // relé: DAL-########  ·  lector: DAL-L + 8 hex
 const LIM = { p: 100, g: 8, s: 8 };
 const ONLINE_MS = 45000;
 const UNCL_TTL = 7 * 864e5;
@@ -41,7 +41,7 @@ const sha = s => crypto.createHash('sha256').update(String(s)).digest();
 const safeEq = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
 const nowS = () => Math.floor(Date.now() / 1000);
 const fnu = async (p) => { const r = await p; return r && Object.prototype.hasOwnProperty.call(r, 'value') && r.ok !== undefined ? r.value : r; };
-const blank = () => ({ rev: 0, people: [], groups: [], scheds: [], cmds: [], mode: 0, relay: 0, ip: '', rssi: 0, fw: '', lastSeen: null, lastCard: 0, devTs: 0, devName: '' });
+const blank = () => ({ rev: 0, people: [], groups: [], scheds: [], cmds: [], mode: 0, relay: 0, ip: '', rssi: 0, fw: '', lastSeen: null, lastCard: 0, devTs: 0, devName: '', slave: null, lectorSeen: null, backupAt: 0 });
 
 // ---------- usuarios ----------
 const tries = new Map();
@@ -89,7 +89,11 @@ app.get('/api/devices', needUser, wrap(async (req, res) => {
 app.post('/api/devices', needUser, wrap(async (req, res) => {
   const model = clean(req.body.model, 20), serial = clean(req.body.serial, 20).toUpperCase(), name = clean(req.body.name);
   if (!MODELS.includes(model)) return fail(res, 400, 'Modelo no soportado');
-  if (!SERIAL_RE.test(serial)) return fail(res, 400, 'Número de serie no válido (DAL-########)');
+  if (!SERIAL_RE.test(serial)) return fail(res, 400, 'Número de serie no válido (DAL-######## o DAL-L########)');
+  if (/^DAL-\d{8}$/.test(serial)) {   // relé: si ya es esclavo de un lector no se registra por separado
+    const m = await devices.findOne({ 'slave.serial': serial, owner: { $ne: null } });
+    if (m) return fail(res, 409, 'Ese relé es esclavo del lector ' + m.serial + '; se gestiona desde el lector');
+  }
   try {
     await devices.findOneAndUpdate({ serial, owner: null },
       { $set: { owner: req.uid, model, label: name || serial, claimedAt: new Date() }, $unset: { exp: '' }, $setOnInsert: { secret: null, ...blank() } },
@@ -124,7 +128,9 @@ app.use('/api/d/:serial', needUser, own, R);
 R.get('/status', (req, res) => {
   const d = req.dev;
   res.json({ serial: d.serial, model: d.model, name: d.label || d.devName || d.serial, mode: d.mode, relay: d.relay, ip: d.ip, rssi: d.rssi, fw: d.fw,
-    online: !!isOnline(d), lastSeen: d.lastSeen ? Math.floor(new Date(d.lastSeen).getTime() / 1000) : 0, lastCard: d.lastCard || 0, time: d.devTs || 0, rev: d.rev });
+    online: !!isOnline(d), lastSeen: d.lastSeen ? Math.floor(new Date(d.lastSeen).getTime() / 1000) : 0, lastCard: d.lastCard || 0, time: d.devTs || 0, rev: d.rev,
+    slave: d.slave ? { serial: d.slave.serial, link: d.slave.link, chan: d.slave.chan, seen: d.slave.at ? Math.floor(new Date(d.slave.at).getTime() / 1000) : 0 } : null,
+    viaBackup: !!(d.backupAt && Date.now() - d.backupAt < ONLINE_MS && !(d.lectorSeen && Date.now() - new Date(d.lectorSeen).getTime() < ONLINE_MS)) });
 });
 R.post('/door', wrap(async (req, res) => {
   const cmd = String(req.body.cmd || '');
@@ -221,7 +227,7 @@ const deviceAuth = wrap(async (req, res, next) => {
     d = await devices.findOne({ serial });
   }
   if (!d || !d.secret || !safeEq(d.secret, key)) return res.status(403).type('text').send('FORBIDDEN\n');
-  req.dev = d; next();
+  req.dev = d; req.backup = req.get('X-Role') === 'backup' && model === 'DAL-LECTOR'; next();
 });
 const lines = body => String(body || '').split('\n').map(l => l.replace(/\r$/, '')).filter(Boolean).map(l => l.split('|'));
 
@@ -238,8 +244,14 @@ function parseSnapshot(ls) {
 app.post('/api/device/poll', deviceAuth, wrap(async (req, res) => {
   const d = req.dev, ls = lines(req.body), H = ls.find(f => f[0] === 'H') || [];
   const txt = s => clean(s, 40);
-  const set = { lastSeen: new Date(), mode: Math.min(2, Math.max(0, int(H[3], 0))), relay: int(H[4], 0) ? 1 : 0, ip: txt(H[5]), rssi: int(H[6], 0), fw: txt(H[7]),
-    devTs: int(H[8], 0), lastCard: Math.max(0, Number(H[9]) || 0), devName: txt(H[10]) };
+  const bk = !!req.backup;   // el relé en respaldo habla con la identidad del lector, pero NO es maestro: no toca IP, nombre, FW ni datos
+  const base = { lastSeen: new Date(), mode: Math.min(2, Math.max(0, int(H[3], 0))), relay: int(H[4], 0) ? 1 : 0 };
+  const set = bk ? { ...base, backupAt: Date.now() }
+    : { ...base, lectorSeen: new Date(), ip: txt(H[5]), rssi: int(H[6], 0), fw: txt(H[7]), devTs: int(H[8], 0), lastCard: Math.max(0, Number(H[9]) || 0), devName: txt(H[10]) };
+  if (!bk) {   // dispositivo esclavo: lo reporta el lector (línea L|serie|enlace|canal|segundos); solo lectura en la nube
+    const L = ls.find(f => f[0] === 'L');
+    set.slave = L && /^DAL-\d{8}$/.test(L[1] || '') ? { serial: L[1], link: int(L[2], 0) === 1 ? 1 : 2, chan: Math.min(14, Math.max(0, int(L[3], 0))), age: Math.max(0, int(L[4], 0)), at: new Date() } : null;
+  }
   if (!d.owner) {
     await devices.updateOne({ serial: d.serial }, { $set: { ...set, exp: new Date(Date.now() + UNCL_TTL) } });
     return res.type('text').send('UNCLAIMED\n');
@@ -251,7 +263,7 @@ app.post('/api/device/poll', deviceAuth, wrap(async (req, res) => {
   if (evs.length) { try { await events.insertMany(evs, { ordered: false }); } catch (e) { if (e.code !== 11000 && !(e.writeErrors || []).every(w => w.code === 11000)) throw e; } }
   const acks = ls.filter(f => f[0] === 'K').map(f => int(f[1], -1));
   const upd = { $set: set, $pull: { cmds: { $or: [{ id: { $in: acks } }, { at: { $lt: Date.now() - 6e5 } }] } } };
-  const push = int(H[2], 0) === 1;
+  const push = !bk && int(H[2], 0) === 1;   // el respaldo nunca sube ni sobrescribe personas/horarios
   if (push) Object.assign(upd.$set, parseSnapshot(ls)), upd.$inc = { rev: 1 };
   const nd = await fnu(devices.findOneAndUpdate({ serial: d.serial, owner: d.owner }, upd, { returnDocument: 'after' }));
   if (!nd) return res.type('text').send('UNCLAIMED\n');
@@ -263,6 +275,7 @@ app.post('/api/device/poll', deviceAuth, wrap(async (req, res) => {
 
 // El equipo pide desvincularse (al restablecer de fábrica): queda libre para otra cuenta.
 app.post('/api/device/unlink', deviceAuth, wrap(async (req, res) => {
+  if (req.backup) return res.status(403).type('text').send('FORBIDDEN\n');
   const d = req.dev;
   if (d.owner) {
     await devices.updateOne({ serial: d.serial, owner: d.owner },
