@@ -246,7 +246,7 @@ app.post('/api/device/poll', deviceAuth, wrap(async (req, res) => {
   }
   // eventos
   const boot = txt(H[11]);
-  const evs = ls.filter(f => f[0] === 'E' && f.length >= 5 && 'ADURBMW'.includes(f[3][0] || '-')).slice(0, 20)
+  const evs = ls.filter(f => f[0] === 'E' && f.length >= 5 && 'ADURBMWL'.includes(f[3][0] || '-')).slice(0, 20)
     .map(f => ({ serial: d.serial, boot, seq: int(f[1], 0), ts: int(f[2], 0), t: f[3][0], who: clean(f[4], 28), rcv: new Date() }));
   if (evs.length) { try { await events.insertMany(evs, { ordered: false }); } catch (e) { if (e.code !== 11000 && !(e.writeErrors || []).every(w => w.code === 11000)) throw e; } }
   const acks = ls.filter(f => f[0] === 'K').map(f => int(f[1], -1));
