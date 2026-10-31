@@ -911,6 +911,7 @@ app.post(
     }
     if (body.evt === 'btn') logEvent(d, 'open-button'); // salida por botón / contacto seco
     if (body.evt === 'web') logEvent(d, 'open-web'); // apertura desde la interfaz web del propio equipo
+    if (body.evt === 'apple') logEvent(d, 'open-apple', 'Apple Home'); // apertura desde Apple Home (HomeKit)
     d.lastSeen = new Date().toISOString();
     if (Number.isFinite(body.rssi)) d.rssi = body.rssi;
     if (typeof body.fw === 'string') d.fw = body.fw.slice(0, 20);
