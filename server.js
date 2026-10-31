@@ -17,7 +17,6 @@
  *    JWT_SECRET      texto largo aleatorio para firmar sesiones
  *    DEVICE_KEY      clave de los ESP-01 (la misma que ya tienen grabada)
  *    ADMIN_EMAIL / ADMIN_PASSWORD   crean tu usuario administrador la primera vez
- *    ALLOWED_ORIGIN  https://TU-USUARIO.github.io
  *    APP_TIMEZONE, POLL_SECONDS, MONGODB_DB (opcionales)
  */
 
@@ -38,7 +37,6 @@ const DEVICE_KEY = process.env.DEVICE_KEY || '';
 const DEFAULT_TZ = process.env.APP_TIMEZONE || 'America/Mexico_City';
 const OPEN_SECONDS = clamp(Number(process.env.OPEN_SECONDS) || 5, 1, 30); // cuánto se mantiene energizado el relé al abrir
 const POLL_SECONDS = clamp(Number(process.env.POLL_SECONDS) || 10, 3, 120);
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const MAX_ROUTINES_PER_ACCOUNT = 200;
 const MAX_ORPHANS = 500;
 
@@ -383,7 +381,7 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(
   cors({
-    origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',').map((s) => s.trim()),
+    origin: true, // cualquier página puede abrir el panel; la seguridad va en el token de inicio de sesión
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
@@ -967,7 +965,9 @@ app.post(
       const timer = setTimeout(release, LP_SECONDS * 1000);
       const w = { release };
       waiters.set(id, w);
-      req.on('close', () => {
+      // OJO: se escucha 'close' de la RESPUESTA, no de la petición. En Node >= 16 el 'close' de req se dispara
+      // en cuanto termina de leerse el cuerpo (a los pocos ms), lo que borraba el waiter y dejaba la consulta colgada.
+      res.on('close', () => {
         if (done) return;
         done = true;
         clearTimeout(timer);
@@ -1156,7 +1156,11 @@ async function main() {
   setInterval(flushDirty, 2000).unref();
   cron.schedule('* * * * *', () => evaluateSchedules().catch((e) => console.error('[scheduler]', e.message)), { timezone: DEFAULT_TZ });
 
-  app.listen(PORT, () => console.log(`API lista en el puerto ${PORT}`));
+  const httpServer = app.listen(PORT, () => console.log(`API lista en el puerto ${PORT}`));
+  // Las consultas largas del equipo (hasta LONGPOLL_SECONDS) no deben cortarse por los límites por defecto de Node.
+  httpServer.requestTimeout = 0;
+  httpServer.headersTimeout = 65000;
+  httpServer.keepAliveTimeout = 65000;
 
   process.on('SIGTERM', async () => {
     await flushDirty();
