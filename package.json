@@ -1,7 +1,7 @@
 {
   "name": "acceso-control-backend",
-  "version": "2.0.0",
-  "description": "API multi-cliente de control de acceso con ESP-01 + relé (MongoDB Atlas)",
+  "version": "3.6.0",
+  "description": "API multi-cliente de control de acceso con ESP32 / ESP-01 + relé y gestión de personas / tarjetas (MongoDB Atlas)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

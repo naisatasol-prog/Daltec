@@ -121,6 +121,12 @@ function wake(id) {
   const w = waiters.get(id);
   if (w && typeof w.release === 'function') w.release();
 }
+function wakeAccount(accountId) {
+  if (!accountId) return;
+  for (const d of devices.values()) {
+    if (d.accountId === accountId) wake(d._id);
+  }
+}
 const runtime = new Map(); // deviceId -> { pendingWifi, pendingOpen, lastSaved }
 const accountCodes = new Set(); // códigos de cuenta en minúsculas
 const dirty = new Set();
@@ -241,6 +247,8 @@ function toPublic(d) {
     serial: d.serial || d._id,
     model: d.model || null,
     openSecs: d.openSecs || null,
+    lastCard: d.lastCard || null,
+    lastCardAt: d.lastCardAt || null,
     wifiStatus: d.wifiStatus, // nunca incluye la contraseña
   };
 }
@@ -383,12 +391,12 @@ app.use(
   cors({
     origin: true, // cualquier página puede abrir el panel; la seguridad va en el token de inicio de sesión
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-device-key'],
   })
 );
 app.use(express.json({ limit: '400kb' }));
 
-app.get('/', (req, res) => res.json({ ok: true, service: 'acceso-control-api', version: 2 }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'acceso-control-api', version: '3.6.0' }));
 app.get('/health', (req, res) => res.type('text').send('ok'));
 
 /* ---------- Autenticación ---------- */
@@ -519,11 +527,12 @@ app.get(
   requireClient,
   ah(async (req, res) => {
     const aid = req.account._id;
-    const [sites, zones, routines, models] = await Promise.all([
+    const [sites, zones, routines, models, people] = await Promise.all([
       cols.sites.find({ accountId: aid }).sort({ name: 1 }).toArray(),
       cols.zones.find({ accountId: aid }).sort({ name: 1 }).toArray(),
       cols.routines.find({ accountId: aid }).toArray(),
       cols.models.find({ active: true }).sort({ brand: 1, name: 1 }).toArray(),
+      cols.people ? cols.people.find({ accountId: aid }).sort({ name: 1 }).toArray() : [],
     ]);
     const fix = (x) => ({ ...x, id: x._id });
     const events = req.query.events ? (await cols.events.find({ accountId: aid }).sort({ at: -1 }).limit(100).toArray()).map((e) => ({ id: String(e._id), deviceId: e.deviceId, name: e.name, type: e.type, who: e.who, at: e.at.toISOString() })) : undefined;
@@ -537,6 +546,7 @@ app.get(
       zones: zones.map(fix),
       routines: routines.map(fix),
       models: models.map(fix),
+      people: people.map(fixPerson),
       devices: [...devices.values()].filter((d) => d.accountId === aid).map(toPublic).sort((a, b) => a.name.localeCompare(b.name)),
     });
   })
@@ -867,6 +877,249 @@ app.delete(
   })
 );
 
+/* ---------- Cliente: personas y tarjetas de acceso ---------- */
+const cleanCard = (c) => {
+  if (typeof c !== 'string') return null;
+  const s = c.trim().toUpperCase();
+  return /^[0-9A-F]{8,20}$/.test(s) ? s : null;
+};
+
+const cleanPerson = (b) => {
+  const name = String(b.name || '').trim().slice(0, 31);
+  if (!name) throw new HttpError(400, 'El nombre es obligatorio');
+  const no = String(b.no || '').trim().slice(0, 15);
+  const enabled = b.enabled !== false;
+
+  let cards = [];
+  if (Array.isArray(b.cards)) {
+    for (const c of b.cards) {
+      const card = cleanCard(c);
+      if (card && !cards.includes(card) && cards.length < 5) cards.push(card);
+    }
+  }
+
+  let schedule = { enabled: false, days: [1, 2, 3, 4, 5], start: '08:00', end: '18:00' };
+  if (b.schedule && typeof b.schedule === 'object') {
+    const s = b.schedule;
+    const schedEnabled = Boolean(s.enabled);
+    let days = [1, 2, 3, 4, 5];
+    if (Array.isArray(s.days)) {
+      days = [...new Set(s.days.map(Number).filter((d) => d >= 0 && d <= 6))];
+      if (!days.length) days = [1, 2, 3, 4, 5];
+    }
+    const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+    const start = TIME_RE.test(s.start) ? s.start : '08:00';
+    const end = TIME_RE.test(s.end) ? s.end : '18:00';
+    schedule = { enabled: schedEnabled, days, start, end };
+  }
+
+  return { name, no, enabled, cards, schedule };
+};
+
+const cleanPersonUpdate = (b) => {
+  const set = {};
+  if (b.name !== undefined) {
+    const name = String(b.name || '').trim().slice(0, 31);
+    if (!name) throw new HttpError(400, 'El nombre es obligatorio');
+    set.name = name;
+  }
+  if (b.no !== undefined) set.no = String(b.no || '').trim().slice(0, 15);
+  if (b.enabled !== undefined) set.enabled = Boolean(b.enabled);
+  if (Array.isArray(b.cards)) {
+    const cards = [];
+    for (const c of b.cards) {
+      const card = cleanCard(c);
+      if (card && !cards.includes(card) && cards.length < 5) cards.push(card);
+    }
+    set.cards = cards;
+  }
+  if (b.schedule && typeof b.schedule === 'object') {
+    const s = b.schedule;
+    const schedEnabled = Boolean(s.enabled);
+    let days = [1, 2, 3, 4, 5];
+    if (Array.isArray(s.days)) {
+      days = [...new Set(s.days.map(Number).filter((d) => d >= 0 && d <= 6))];
+      if (!days.length) days = [1, 2, 3, 4, 5];
+    }
+    const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+    const start = TIME_RE.test(s.start) ? s.start : '08:00';
+    const end = TIME_RE.test(s.end) ? s.end : '18:00';
+    set.schedule = { enabled: schedEnabled, days, start, end };
+  }
+  return set;
+};
+
+const fixPerson = (p) => ({
+  id: p._id,
+  name: p.name,
+  no: p.no || '',
+  enabled: p.enabled !== false,
+  cards: Array.isArray(p.cards) ? p.cards : [],
+  schedule: p.schedule || { enabled: false, days: [1, 2, 3, 4, 5], start: '08:00', end: '18:00' },
+  createdAt: p.createdAt,
+  updatedAt: p.updatedAt,
+});
+
+async function bumpPeopleVer(accountId) {
+  const ver = Math.floor(Date.now() / 1000);
+  await cols.accounts.updateOne({ _id: accountId }, { $set: { peopleVer: ver } });
+  wakeAccount(accountId);
+  return ver;
+}
+
+app.get(
+  '/api/people',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const list = await cols.people.find({ accountId: aid }).sort({ name: 1 }).toArray();
+    res.json(list.map(fixPerson));
+  })
+);
+
+app.post(
+  '/api/people',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const count = await cols.people.countDocuments({ accountId: aid });
+    if (count >= 100) throw new HttpError(400, 'Límite de 100 personas por cuenta alcanzado');
+    const p = cleanPerson(req.body || {});
+    if (p.cards && p.cards.length) {
+      const dup = await cols.people.findOne({ accountId: aid, cards: { $in: p.cards } });
+      if (dup) throw new HttpError(409, `Una de las tarjetas ya está asignada a ${dup.name}`);
+    }
+    p._id = uid();
+    p.accountId = aid;
+    p.createdAt = new Date().toISOString();
+    p.updatedAt = p.createdAt;
+    await cols.people.insertOne(p);
+    await bumpPeopleVer(aid);
+    res.status(201).json(fixPerson(p));
+  })
+);
+
+app.patch(
+  '/api/people/:id',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const cur = await cols.people.findOne({ _id: req.params.id, accountId: aid });
+    if (!cur) throw new HttpError(404, 'Persona no encontrada');
+    const update = cleanPersonUpdate(req.body || {});
+    if (update.cards && update.cards.length) {
+      const dup = await cols.people.findOne({ accountId: aid, _id: { $ne: cur._id }, cards: { $in: update.cards } });
+      if (dup) throw new HttpError(409, `Una de las tarjetas ya está asignada a ${dup.name}`);
+    }
+    update.updatedAt = new Date().toISOString();
+    await cols.people.updateOne({ _id: cur._id }, { $set: update });
+    await bumpPeopleVer(aid);
+    res.json(fixPerson({ ...cur, ...update }));
+  })
+);
+
+app.delete(
+  '/api/people/:id',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const r = await cols.people.deleteOne({ _id: req.params.id, accountId: aid });
+    if (!r.deletedCount) throw new HttpError(404, 'Persona no encontrada');
+    await bumpPeopleVer(aid);
+    res.json({ ok: true });
+  })
+);
+
+app.post(
+  '/api/people/:id/cards',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const cur = await cols.people.findOne({ _id: req.params.id, accountId: aid });
+    if (!cur) throw new HttpError(404, 'Persona no encontrada');
+    const card = cleanCard((req.body || {}).card);
+    if (!card) throw new HttpError(400, 'Código de tarjeta inválido (hexadecimal 8-20 dígitos)');
+    if (cur.cards && cur.cards.includes(card)) throw new HttpError(409, 'Esta persona ya tiene registrada esa tarjeta');
+    if (cur.cards && cur.cards.length >= 5) throw new HttpError(400, 'Máximo 5 tarjetas por persona');
+    const dup = await cols.people.findOne({ accountId: aid, _id: { $ne: cur._id }, cards: card });
+    if (dup) throw new HttpError(409, `La tarjeta ya está asignada a ${dup.name}`);
+    await cols.people.updateOne({ _id: cur._id }, { $push: { cards: card }, $set: { updatedAt: new Date().toISOString() } });
+    await bumpPeopleVer(aid);
+    const updated = await cols.people.findOne({ _id: cur._id });
+    res.json(fixPerson(updated));
+  })
+);
+
+app.delete(
+  '/api/people/:id/cards/:card',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const cur = await cols.people.findOne({ _id: req.params.id, accountId: aid });
+    if (!cur) throw new HttpError(404, 'Persona no encontrada');
+    const card = cleanCard(req.params.card);
+    if (!card) throw new HttpError(400, 'Tarjeta inválida');
+    await cols.people.updateOne({ _id: cur._id }, { $pull: { cards: card }, $set: { updatedAt: new Date().toISOString() } });
+    await bumpPeopleVer(aid);
+    const updated = await cols.people.findOne({ _id: cur._id });
+    res.json(fixPerson(updated));
+  })
+);
+
+/* Endpoint para que el ESP32 descargue usuarios de su cuenta */
+app.get(
+  '/api/devices/:id/users',
+  requireDeviceKey,
+  ah(async (req, res) => {
+    const id = String(req.params.id).toLowerCase();
+    const d = devices.get(id);
+    if (!d || !d.accountId) {
+      return res.json({ version: 1, users: [] });
+    }
+    const acc = await cols.accounts.findOne({ _id: d.accountId });
+    const people = await cols.people.find({ accountId: d.accountId }).sort({ name: 1 }).toArray();
+
+    const users = people.map((p, idx) => {
+      let daysMask = 0x7f;
+      let sh = 0, sm = 0, eh = 23, em = 59;
+      let hasSched = false;
+      if (p.schedule && p.schedule.enabled) {
+        hasSched = true;
+        if (Array.isArray(p.schedule.days)) {
+          daysMask = 0;
+          for (const day of p.schedule.days) daysMask |= (1 << (Number(day) % 7));
+        }
+        if (typeof p.schedule.start === 'string') {
+          const parts = p.schedule.start.split(':').map(Number);
+          if (parts.length >= 2) { sh = parts[0] || 0; sm = parts[1] || 0; }
+        }
+        if (typeof p.schedule.end === 'string') {
+          const parts = p.schedule.end.split(':').map(Number);
+          if (parts.length >= 2) { eh = parts[0] || 0; em = parts[1] || 0; }
+        }
+      }
+      return {
+        id: idx + 1,
+        name: String(p.name || '').slice(0, 31),
+        no: String(p.no || '').slice(0, 15),
+        en: p.enabled !== false,
+        cards: Array.isArray(p.cards) ? p.cards.slice(0, 3) : [],
+        hasSchedule: hasSched,
+        days: daysMask,
+        startHour: sh,
+        startMin: sm,
+        endHour: eh,
+        endMin: em,
+      };
+    });
+
+    res.json({
+      version: (acc && acc.peopleVer) || 1,
+      users,
+    });
+  })
+);
+
 /* ---------- ESP-01 (protocolo idéntico a la v1) ---------- */
 app.post(
   '/api/devices/:id/status',
@@ -909,8 +1162,21 @@ app.post(
       const h = vcHash(id, body.vc);
       if (d.vcHash !== h) { d.vcHash = h; changed = true; }
     }
+    if (typeof body.lastCard === 'string' && /^([0-9A-Fa-f]{8,20})$/.test(body.lastCard)) {
+      d.lastCard = body.lastCard.toUpperCase();
+      d.lastCardAt = new Date().toISOString();
+      changed = true;
+    }
+    if (typeof body.card === 'string' && /^([0-9A-Fa-f]{8,20})$/.test(body.card)) {
+      d.lastCard = body.card.toUpperCase();
+      d.lastCardAt = new Date().toISOString();
+      changed = true;
+    }
     if (body.evt === 'btn') logEvent(d, 'open-button'); // salida por botón / contacto seco
     if (body.evt === 'web') logEvent(d, 'open-web'); // apertura desde la interfaz web del propio equipo
+    if (body.evt === 'card') logEvent(d, 'open-card', typeof body.who === 'string' ? body.who.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40) : null); // apertura con tarjeta (ESP32 + PN532)
+    if (body.evt === 'denied') logEvent(d, 'card-denied', typeof body.who === 'string' ? body.who.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40) : null); // tarjeta rechazada
+    if (body.evt === 'sched-denied') logEvent(d, 'card-sched', typeof body.who === 'string' ? body.who.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40) : null); // fuera de horario permitido
     d.lastSeen = new Date().toISOString();
     if (Number.isFinite(body.rssi)) d.rssi = body.rssi;
     if (typeof body.fw === 'string') d.fw = body.fw.slice(0, 20);
@@ -924,6 +1190,18 @@ app.post(
     }
     if (applyWifiResult(d, body.wifiResult)) changed = true;
 
+    // Verificar si el equipo necesita sincronizar la base de usuarios de su cuenta
+    let needUsersSync = false;
+    let currentPeopleVer = 1;
+    if (d.accountId && cols.accounts) {
+      const acc = await cols.accounts.findOne({ _id: d.accountId });
+      currentPeopleVer = (acc && acc.peopleVer) || 1;
+      const devUsersVer = Number(body.usersVer) || 0;
+      if (devUsersVer !== currentPeopleVer) {
+        needUsersSync = true;
+      }
+    }
+
     const r = rt(id);
     if (changed || Date.now() - r.lastSaved > 60000) {
       r.lastSaved = Date.now();
@@ -932,7 +1210,16 @@ app.post(
 
     // Respuesta: se arma al momento de enviarla (así, si el equipo esperaba, recibe lo último).
     const buildReply = () => {
-      const reply = { desired: d.desiredState, lock: modeOf(d) === 'closed' ? 1 : 0, pollSeconds: POLL_SECONDS, lp: 1, serverTime: new Date().toISOString() };
+      const reply = {
+        desired: d.desiredState,
+        lock: modeOf(d) === 'closed' ? 1 : 0,
+        pollSeconds: POLL_SECONDS,
+        lp: 1,
+        serverTime: new Date().toISOString(),
+        serverEpoch: Math.floor(Date.now() / 1000),
+        usersVer: currentPeopleVer,
+        usersSync: needUsersSync ? 1 : 0,
+      };
       if (r.pendingOpen > 0) { reply.open = r.pendingOpen; r.pendingOpen = 0; }
       const pending = r.pendingWifi;
       if (pending) {
@@ -946,9 +1233,9 @@ app.post(
       return reply;
     };
 
-    // ¿Hay algo que decirle ya? (orden de abrir, cambio de modo distinto de lo que reporta, red nueva por enviar)
+    // ¿Hay algo que decirle ya? (orden de abrir, cambio de modo distinto de lo que reporta, red nueva por enviar, sincronización de usuarios)
     const urgent = Boolean(body.evt || body.local === true || body.reset === true || body.wifiResult) || r.pendingOpen > 0 || reported !== d.desiredState || (r.pendingWifi && d.wifiStatus && d.wifiStatus.state === 'pending') ||
-      (modeOf(d) === 'closed') !== (body.lock === true);
+      (modeOf(d) === 'closed') !== (body.lock === true) || needUsersSync;
     if (body.wait === 1 && !urgent) {
       // LONG-POLL: se deja la consulta abierta hasta LP_SECONDS; cualquier orden del panel la despierta al instante.
       const old = waiters.get(id);
@@ -1114,6 +1401,7 @@ async function main() {
     routines: db.collection('routines'),
     models: db.collection('models'),
     events: db.collection('events'),
+    people: db.collection('people'),
   };
   await Promise.all([
     cols.accounts.createIndex({ slug: 1 }, { unique: true }),
@@ -1124,6 +1412,8 @@ async function main() {
     cols.routines.createIndex({ accountId: 1 }),
     cols.events.createIndex({ accountId: 1, at: -1 }),
     cols.events.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 180 }), // el registro se conserva 180 días
+    cols.people.createIndex({ accountId: 1 }),
+    cols.people.createIndex({ accountId: 1, 'cards': 1 }),
   ]);
 
   // Administrador inicial (solo si no existe ninguno).
