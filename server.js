@@ -162,43 +162,6 @@ function logEvent(d, type, who) {
     .catch((e) => console.error('[events]', e.message));
 }
 
-// El ESP32 conserva los eventos sin conexión y luego los envía por lotes.
-// `sourceEventId` vuelve idempotente el reintento: una respuesta perdida no
-// duplica registros en MongoDB ni en el panel.
-const DEVICE_EVENT_TYPES = {
-  btn: 'open-button',
-  dry: 'open-dry',
-  web: 'open-web',
-  card: 'open-card',
-  denied: 'card-denied',
-  'sched-denied': 'card-sched',
-};
-async function ingestDeviceEvents(d, list) {
-  if (!d.accountId || !Array.isArray(list) || !cols.events) return;
-  const seen = new Set();
-  const jobs = [];
-  for (const item of list.slice(0, 8)) {
-    if (!item || typeof item !== 'object') continue;
-    const sourceEventId = String(item.id || '').toLowerCase();
-    const type = DEVICE_EVENT_TYPES[String(item.evt || '')];
-    if (!/^[a-f0-9]{16}$/.test(sourceEventId) || !type || seen.has(sourceEventId)) continue;
-    seen.add(sourceEventId);
-    const who = typeof item.who === 'string'
-      ? item.who.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40) || null
-      : null;
-    const epoch = Number(item.at);
-    const at = Number.isInteger(epoch) && epoch > 1700000000 && epoch < 4102444800
-      ? new Date(epoch * 1000)
-      : new Date();
-    jobs.push(cols.events.updateOne(
-      { deviceId: d._id, sourceEventId },
-      { $setOnInsert: { accountId: d.accountId, deviceId: d._id, name: d.name, type, who, at, sourceEventId } },
-      { upsert: true },
-    ));
-  }
-  if (jobs.length) await Promise.all(jobs);
-}
-
 /** Desvincula el equipo de la cuenta (restablecer de fábrica): queda libre otra vez con su serie + código. */
 function unlinkDevice(d, reported) {
   if (!d.accountId) return false;
@@ -266,8 +229,10 @@ function isOnline(d) {
 }
 
 function toPublic(d) {
+  const isSw = String(d.model || '').toUpperCase().includes('SW') || String(d.serial || d._id).toLowerCase().startsWith('dalsw');
   return {
     id: d._id,
+    type: isSw ? 'switch' : 'door',
     accountId: d.accountId,
     name: d.name,
     modelId: d.modelId,
@@ -1136,7 +1101,7 @@ app.get(
         }
       }
       return {
-        id: p._id, // UUID estable: permite que el ESP32 actualice la misma persona al trabajar offline
+        id: idx + 1,
         name: String(p.name || '').slice(0, 31),
         no: String(p.no || '').slice(0, 15),
         en: p.enabled !== false,
@@ -1154,87 +1119,6 @@ app.get(
       version: (acc && acc.peopleVer) || 1,
       users,
     });
-  })
-);
-
-/* Cambios hechos en la interfaz local del ESP32. El equipo conserva el UUID
- * de cada persona, por lo que una reconexión actualiza en vez de duplicar. */
-app.post(
-  '/api/devices/:id/users',
-  requireDeviceKey,
-  ah(async (req, res) => {
-    const deviceId = String(req.params.id).toLowerCase();
-    const d = devices.get(deviceId);
-    if (!d || !d.accountId) throw new HttpError(403, 'El equipo debe estar vinculado a una cuenta');
-    const body = req.body || {};
-    if (!Array.isArray(body.users) || body.users.length > 100) throw new HttpError(400, 'Lista de personas inválida');
-    const aid = d.accountId;
-    const current = await cols.people.find({ accountId: aid }).toArray();
-    const byId = new Map(current.map((p) => [p._id, p]));
-    let count = current.length;
-    let changed = false;
-
-    // Las bajas se mandan separadas para que no se borre a alguien por una
-    // caché incompleta. Solo se acepta el UUID que el propio ESP recibió.
-    const deleted = [...new Set(Array.isArray(body.deleted) ? body.deleted.map(String) : [])].filter((id) => ID_RE.test(id));
-    for (const personId of deleted.slice(0, 100)) {
-      if (byId.has(personId)) {
-        await cols.people.deleteOne({ _id: personId, accountId: aid });
-        byId.delete(personId);
-        changed = true;
-      }
-    }
-
-    const map = [];
-    for (const raw of body.users) {
-      if (!raw || typeof raw !== 'object') continue;
-      const localId = Number(raw.localId);
-      if (!Number.isInteger(localId) || localId < 1 || localId > 100) continue;
-      const p = cleanPerson({
-        name: raw.name,
-        no: raw.no,
-        enabled: raw.en !== false,
-        cards: raw.cards,
-        schedule: {
-          enabled: Boolean(raw.hasSchedule),
-          days: Array.from({ length: 7 }, (_, day) => (Number(raw.days) & (1 << day) ? day : -1)).filter((day) => day >= 0),
-          start: `${String(Math.max(0, Math.min(23, Number(raw.startHour) || 0))).padStart(2, '0')}:${String(Math.max(0, Math.min(59, Number(raw.startMin) || 0))).padStart(2, '0')}`,
-          end: `${String(Math.max(0, Math.min(23, Number(raw.endHour) || 23))).padStart(2, '0')}:${String(Math.max(0, Math.min(59, Number(raw.endMin) || 59))).padStart(2, '0')}`,
-        },
-      });
-      const requestedId = String(raw.id || '');
-      let cur = ID_RE.test(requestedId) ? byId.get(requestedId) : null;
-      // Compatibilidad con equipos que tenían usuarios locales antes de v1.3.
-      if (!cur) {
-        const matches = [...byId.values()].filter((x) =>
-          (p.no && x.no === p.no) ||
-          p.cards.some((card) => Array.isArray(x.cards) && x.cards.includes(card)) ||
-          (!p.no && !p.cards.length && x.name === p.name),
-        );
-        if (matches.length === 1) cur = matches[0];
-      }
-      if (cur) {
-        p.updatedAt = new Date().toISOString();
-        await cols.people.updateOne({ _id: cur._id, accountId: aid }, { $set: p });
-        byId.set(cur._id, { ...cur, ...p });
-        map.push({ localId, id: cur._id });
-        changed = true;
-      } else {
-        if (count >= 100) throw new HttpError(400, 'Límite de 100 personas por cuenta alcanzado');
-        p._id = uid();
-        p.accountId = aid;
-        p.createdAt = new Date().toISOString();
-        p.updatedAt = p.createdAt;
-        await cols.people.insertOne(p);
-        byId.set(p._id, p);
-        count++;
-        map.push({ localId, id: p._id });
-        changed = true;
-      }
-    }
-    const acc = changed ? null : await cols.accounts.findOne({ _id: aid });
-    const version = changed ? await bumpPeopleVer(aid) : (acc && acc.peopleVer) || 1;
-    res.json({ ok: true, version, map });
   })
 );
 
@@ -1290,9 +1174,7 @@ app.post(
       d.lastCardAt = new Date().toISOString();
       changed = true;
     }
-    await ingestDeviceEvents(d, body.events); // cola persistente del ESP32 (hasta 8 por petición)
     if (body.evt === 'btn') logEvent(d, 'open-button'); // salida por botón / contacto seco
-    if (body.evt === 'dry') logEvent(d, 'open-dry'); // contacto seco GPIO32 ↔ GPIO33
     if (body.evt === 'web') logEvent(d, 'open-web'); // apertura desde la interfaz web del propio equipo
     if (body.evt === 'card') logEvent(d, 'open-card', typeof body.who === 'string' ? body.who.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40) : null); // apertura con tarjeta (ESP32 + PN532)
     if (body.evt === 'denied') logEvent(d, 'card-denied', typeof body.who === 'string' ? body.who.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 40) : null); // tarjeta rechazada
@@ -1532,7 +1414,6 @@ async function main() {
     cols.routines.createIndex({ accountId: 1 }),
     cols.events.createIndex({ accountId: 1, at: -1 }),
     cols.events.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 180 }), // el registro se conserva 180 días
-    cols.events.createIndex({ deviceId: 1, sourceEventId: 1 }, { unique: true, partialFilterExpression: { sourceEventId: { $type: 'string' } } }),
     cols.people.createIndex({ accountId: 1 }),
     cols.people.createIndex({ accountId: 1, 'cards': 1 }),
   ]);
