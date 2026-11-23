@@ -306,8 +306,13 @@ function zoneTree(rootId, zones) {
 }
 
 function devicesFor(accountId, target, zones) {
+  if (!target) return [];
   const all = [...devices.values()].filter((d) => d.accountId === accountId);
   if (target.type === 'device') return all.filter((d) => d._id === target.id);
+  if (target.type === 'devices') {
+    const set = new Set((target.ids || []).map((x) => String(x).toLowerCase()));
+    return all.filter((d) => set.has(d._id.toLowerCase()));
+  }
   if (target.type === 'site') return all.filter((d) => d.siteId === target.id);
   if (target.type === 'zone') {
     const ids = zoneTree(target.id, zones);
@@ -318,12 +323,26 @@ function devicesFor(accountId, target, zones) {
 
 async function checkTarget(accountId, target) {
   const t = target || {};
-  if (!['device', 'zone', 'site'].includes(t.type) || typeof t.id !== 'string') throw new HttpError(400, 'Destino inválido');
+  if (!['device', 'devices', 'zone', 'site'].includes(t.type)) throw new HttpError(400, 'Destino inválido');
   if (t.type === 'device') {
+    if (typeof t.id !== 'string') throw new HttpError(400, 'Destino de equipo inválido');
     const d = devices.get(t.id.toLowerCase());
     if (!d || d.accountId !== accountId) throw new HttpError(404, 'Equipo no encontrado');
     return { type: 'device', id: d._id };
   }
+  if (t.type === 'devices') {
+    if (!Array.isArray(t.ids) || !t.ids.length) throw new HttpError(400, 'Selecciona al menos un equipo');
+    const validIds = [];
+    for (const rawId of t.ids) {
+      const d = devices.get(String(rawId).toLowerCase());
+      if (d && d.accountId === accountId && !validIds.includes(d._id)) {
+        validIds.push(d._id);
+      }
+    }
+    if (!validIds.length) throw new HttpError(404, 'Ningún equipo válido seleccionado');
+    return { type: 'devices', ids: validIds };
+  }
+  if (typeof t.id !== 'string') throw new HttpError(400, 'Destino inválido');
   const col = t.type === 'site' ? cols.sites : cols.zones;
   if (!(await col.findOne({ _id: t.id, accountId }))) throw new HttpError(404, t.type === 'site' ? 'Sucursal no encontrada' : 'Zona no encontrada');
   return { type: t.type, id: t.id };
@@ -394,10 +413,25 @@ async function evaluateSchedules(date = new Date()) {
     if (r.offTime === now.hhmm && r.days.includes(overnight ? prevDay : now.day)) state = 'OFF';
     if (!state) continue;
     for (const d of devicesFor(r.accountId, r.target, zonesByAcc.get(r.accountId) || [])) {
-      const target = state === 'ON' ? 'open' : modeOf(d) === 'closed' ? 'closed' : 'normal'; // un plan no desbloquea "mantener cerrada"
-      if (setMode(d, target, 'plan')) {
-        changes.push({ id: d._id, state, routine: r._id });
-        console.log(`[scheduler] ${now.hhmm} → ${d._id}: ${target}`);
+      if (isSwitchDevice(d)) {
+        const desired = state === 'ON' ? 'ON' : 'OFF';
+        const targetMode = desired === 'ON' ? 'open' : 'normal';
+        if (d.desiredState !== desired || d.mode !== targetMode) {
+          d.mode = targetMode;
+          d.desiredState = desired;
+          d.lastToggleAt = Date.now();
+          logEvent(d, `mode-${targetMode}`, 'plan');
+          markDirty(d);
+          wake(d._id);
+          changes.push({ id: d._id, state, routine: r._id });
+          console.log(`[scheduler] ${now.hhmm} → ${d._id}: ${desired}`);
+        }
+      } else {
+        const target = state === 'ON' ? 'open' : modeOf(d) === 'closed' ? 'closed' : 'normal'; // un plan no desbloquea "mantener cerrada"
+        if (setMode(d, target, 'plan')) {
+          changes.push({ id: d._id, state, routine: r._id });
+          console.log(`[scheduler] ${now.hhmm} → ${d._id}: ${target}`);
+        }
       }
     }
   }
@@ -1205,6 +1239,18 @@ app.delete(
 );
 
 /* ---------- Cliente: rutinas ---------- */
+async function notifyDevicesOfRoutine(aid, target) {
+  try {
+    const zones = await cols.zones.find({ accountId: aid }).toArray();
+    for (const d of devicesFor(aid, target, zones)) {
+      markDirty(d);
+      wake(d._id);
+    }
+  } catch (e) {
+    console.error('[sched] Error notificando a equipos:', e.message);
+  }
+}
+
 app.post(
   '/api/routines',
   requireClient,
@@ -1213,6 +1259,7 @@ app.post(
     if ((await cols.routines.countDocuments({ accountId: aid })) >= MAX_ROUTINES_PER_ACCOUNT) throw new HttpError(400, `Máximo ${MAX_ROUTINES_PER_ACCOUNT} rutinas`);
     const r = { _id: uid(), accountId: aid, target: await checkTarget(aid, (req.body || {}).target), ...cleanRoutine(req.body || {}) };
     await cols.routines.insertOne(r);
+    await notifyDevicesOfRoutine(aid, r.target);
     res.status(201).json({ ...r, id: r._id });
   })
 );
@@ -1227,6 +1274,7 @@ app.patch(
     const set = cleanRoutine(b);
     if ((req.body || {}).target) set.target = await checkTarget(aid, req.body.target);
     await cols.routines.updateOne({ _id: cur._id }, { $set: set });
+    await notifyDevicesOfRoutine(aid, set.target || cur.target);
     res.json({ ...cur, ...set, id: cur._id });
   })
 );
@@ -1234,8 +1282,10 @@ app.delete(
   '/api/routines/:id',
   requireClient,
   ah(async (req, res) => {
-    const r = await cols.routines.deleteOne({ _id: req.params.id, accountId: req.account._id });
-    if (!r.deletedCount) throw new HttpError(404, 'Rutina no encontrada');
+    const cur = await cols.routines.findOne({ _id: req.params.id, accountId: req.account._id });
+    if (!cur) throw new HttpError(404, 'Rutina no encontrada');
+    await cols.routines.deleteOne({ _id: cur._id });
+    await notifyDevicesOfRoutine(req.account._id, cur.target);
     res.json({ ok: true });
   })
 );
