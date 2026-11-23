@@ -172,6 +172,8 @@ function unlinkDevice(d, reported) {
   d.modelId = null;
   d.siteId = null;
   d.zoneId = null;
+  d.projectId = null;
+  d.sharedWith = [];
   d.wifiStatus = null;
   d.desiredState = reported || 'OFF';
   d.mode = d.desiredState === 'ON' ? 'open' : 'normal';
@@ -190,6 +192,8 @@ function newDevice(id, accountId, state) {
     modelId: null,
     siteId: null,
     zoneId: null,
+    projectId: null, // proyecto (agrupador) al que pertenece
+    sharedWith: [], // cuentas con acceso compartido (control, no administración)
     desiredState: state || 'OFF',
     mode: state === 'ON' ? 'open' : 'normal', // normal | open (mantener abierta) | closed (mantener cerrada)
     vcHash: null, // hash del código de verificación (nunca se envía al navegador)
@@ -199,9 +203,18 @@ function newDevice(id, accountId, state) {
     fw: null,
     ssid: null,
     wifiStatus: null,
+    role: null,
+    isMaster: false,
+    masterId: null,
+    slavesCount: 0,
     createdAt: new Date().toISOString(),
   };
 }
+
+/* ---------- Espera entre apagar y prender un apagador (evita ciclos rápidos que dañan el foco o el relé) ---------- */
+const SWITCH_COOLDOWN_MS = clamp(Number(process.env.SWITCH_COOLDOWN_SECONDS) || 10, 0, 120) * 1000;
+const isSwitchDevice = (d) => String(d.model || '').toUpperCase().includes('SW') || String(d.serial || d._id).toLowerCase().startsWith('dalsw');
+const cooldownLeft = (d) => (isSwitchDevice(d) && d.lastToggleAt ? Math.max(0, Math.ceil((d.lastToggleAt + SWITCH_COOLDOWN_MS - Date.now()) / 1000)) : 0);
 
 /* ---------- Modos de puerta (como un panel de acceso Hikvision) ----------
  *  normal = cerrada; el botón de salida funciona · open = mantener abierta · closed = mantener cerrada (botón bloqueado)
@@ -214,6 +227,7 @@ function setMode(d, mode, who) {
   if (modeOf(d) === mode) return false;
   d.mode = mode;
   d.desiredState = mode === 'open' ? 'ON' : 'OFF';
+  if (isSwitchDevice(d)) d.lastToggleAt = Date.now(); // registra el momento del cambio para el cooldown
   logEvent(d, `mode-${mode}`, who);
   markDirty(d);
   wake(d._id);
@@ -238,6 +252,8 @@ function toPublic(d) {
     modelId: d.modelId,
     siteId: d.siteId,
     zoneId: d.zoneId,
+    projectId: d.projectId || null,
+    sharedCount: (d.sharedWith || []).length,
     desiredState: d.desiredState,
     mode: modeOf(d),
     reportedState: d.reportedState,
@@ -251,6 +267,11 @@ function toPublic(d) {
     openSecs: d.openSecs || null,
     lastCard: d.lastCard || null,
     lastCardAt: d.lastCardAt || null,
+    cooldown: cooldownLeft(d), // segundos de espera restantes (apagadores)
+    role: d.role || (d.isMaster ? 'master' : (isSw ? 'slave' : null)),
+    isMaster: Boolean(d.isMaster),
+    masterId: d.masterId || null,
+    slavesCount: d.slavesCount || 0,
     wifiStatus: d.wifiStatus, // nunca incluye la contraseña
   };
 }
@@ -398,7 +419,7 @@ app.use(
 );
 app.use(express.json({ limit: '400kb' }));
 
-app.get('/', (req, res) => res.json({ ok: true, service: 'acceso-control-api', version: '3.6.0' }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'acceso-control-api', version: '3.7.0' }));
 app.get('/health', (req, res) => res.type('text').send('ok'));
 
 /* ---------- Autenticación ---------- */
@@ -529,12 +550,13 @@ app.get(
   requireClient,
   ah(async (req, res) => {
     const aid = req.account._id;
-    const [sites, zones, routines, models, people] = await Promise.all([
+    const [sites, zones, routines, models, people, projects] = await Promise.all([
       cols.sites.find({ accountId: aid }).sort({ name: 1 }).toArray(),
       cols.zones.find({ accountId: aid }).sort({ name: 1 }).toArray(),
       cols.routines.find({ accountId: aid }).toArray(),
       cols.models.find({ active: true }).sort({ brand: 1, name: 1 }).toArray(),
       cols.people ? cols.people.find({ accountId: aid }).sort({ name: 1 }).toArray() : [],
+      cols.projects.find({ accountId: aid }).sort({ name: 1 }).toArray(),
     ]);
     const fix = (x) => ({ ...x, id: x._id });
     const events = req.query.events ? (await cols.events.find({ accountId: aid }).sort({ at: -1 }).limit(100).toArray()).map((e) => ({ id: String(e._id), deviceId: e.deviceId, name: e.name, type: e.type, who: e.who, at: e.at.toISOString() })) : undefined;
@@ -549,8 +571,328 @@ app.get(
       routines: routines.map(fix),
       models: models.map(fix),
       people: people.map(fixPerson),
-      devices: [...devices.values()].filter((d) => d.accountId === aid).map(toPublic).sort((a, b) => a.name.localeCompare(b.name)),
+      devices: await overviewDevices(aid, projects),
+      projects: await overviewProjects(aid, projects),
     });
+  })
+);
+
+/* ------------------------------------------------------------
+ *  PROYECTOS: agrupar equipos, compartir (control) o transferir (propiedad) por QR
+ *  - projects: { _id, accountId, name, createdAt, remote? }
+ *    remote = { ownerId, ownerName, ownerProjectId, deviceIds } → proyecto COMPARTIDO conmigo (solo control)
+ *  - devices.projectId (proyecto propio) y devices.sharedWith (cuentas con acceso compartido)
+ *  - shares: invitaciones de un solo uso, caducan en SHARE_MINUTES
+ * ---------------------------------------------------------- */
+const SHARE_MINUTES = 10;
+const MAX_PROJECTS = 50;
+const sharedWithMe = (d, aid) => d.accountId !== aid && Array.isArray(d.sharedWith) && d.sharedWith.includes(aid);
+
+async function overviewDevices(aid, projects) {
+  const remoteOf = new Map(); // deviceId -> { projectId, ownerName }
+  for (const p of projects) if (p.remote) for (const id of p.remote.deviceIds || []) remoteOf.set(id, { projectId: p._id, ownerName: p.remote.ownerName });
+  const out = [];
+  for (const d of devices.values()) {
+    if (d.accountId === aid) out.push(toPublic(d));
+    else if (sharedWithMe(d, aid)) {
+      const r = remoteOf.get(d._id);
+      out.push({ ...toPublic(d), accountId: aid, shared: true, sharedBy: r ? r.ownerName : '', projectId: r ? r.projectId : null, siteId: null, zoneId: null, sharedCount: 0, wifiStatus: null, ssid: null, serial: null });
+    }
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function overviewProjects(aid, projects) {
+  const ownIds = new Set();
+  const names = new Map();
+  const sharedByProject = new Map(); // projectId -> Set(accountId)
+  for (const d of devices.values()) {
+    if (d.accountId !== aid || !d.projectId) continue;
+    for (const a of d.sharedWith || []) {
+      ownIds.add(a);
+      if (!sharedByProject.has(d.projectId)) sharedByProject.set(d.projectId, new Set());
+      sharedByProject.get(d.projectId).add(a);
+    }
+  }
+  if (ownIds.size) for (const a of await cols.accounts.find({ _id: { $in: [...ownIds] } }, { projection: { name: 1 } }).toArray()) names.set(a._id, a.name);
+  return projects.map((p) => ({
+    id: p._id,
+    name: p.name,
+    createdAt: p.createdAt,
+    shared: Boolean(p.remote),
+    sharedBy: p.remote ? p.remote.ownerName : null,
+    sharedWith: p.remote ? [] : [...(sharedByProject.get(p._id) || [])].map((id) => ({ id, name: names.get(id) || id })),
+  }));
+}
+
+async function ownProject(aid, id) {
+  const p = await cols.projects.findOne({ _id: String(id), accountId: aid });
+  if (!p) throw new HttpError(404, 'No existe ese proyecto');
+  return p;
+}
+const ownedProjectDevices = (aid, projectId) => [...devices.values()].filter((d) => d.accountId === aid && d.projectId === projectId);
+
+app.post(
+  '/api/projects',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const name = text((req.body || {}).name, 'Nombre del proyecto', 1, 60);
+    if ((await cols.projects.countDocuments({ accountId: aid })) >= MAX_PROJECTS) throw new HttpError(400, 'Llegaste al máximo de proyectos');
+    const p = { _id: uid(), accountId: aid, name, createdAt: new Date().toISOString() };
+    await cols.projects.insertOne(p);
+    res.status(201).json({ id: p._id, name: p.name, createdAt: p.createdAt, shared: false, sharedWith: [] });
+  })
+);
+
+app.patch(
+  '/api/projects/:id',
+  requireClient,
+  ah(async (req, res) => {
+    const p = await ownProject(req.account._id, req.params.id);
+    if (p.remote) throw new HttpError(403, 'Un proyecto compartido contigo no se puede renombrar');
+    const name = text((req.body || {}).name, 'Nombre del proyecto', 1, 60);
+    await cols.projects.updateOne({ _id: p._id }, { $set: { name } });
+    res.json({ id: p._id, name });
+  })
+);
+
+// Eliminar proyecto propio (los equipos quedan sin proyecto) o salir de un proyecto compartido conmigo.
+app.delete(
+  '/api/projects/:id',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const p = await ownProject(aid, req.params.id);
+    if (p.remote) {
+      for (const id of p.remote.deviceIds || []) {
+        const d = devices.get(id);
+        if (d && Array.isArray(d.sharedWith)) {
+          d.sharedWith = d.sharedWith.filter((a) => a !== aid);
+          markDirty(d);
+        }
+      }
+    } else {
+      for (const d of ownedProjectDevices(aid, p._id)) {
+        d.projectId = null;
+        markDirty(d);
+      }
+    }
+    await cols.projects.deleteOne({ _id: p._id });
+    res.json({ ok: true });
+  })
+);
+
+// Mover equipos a un proyecto (projectId = null → sacarlos del proyecto).
+app.post(
+  '/api/projects/move',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const b = req.body || {};
+    const ids = Array.isArray(b.deviceIds) ? b.deviceIds.map((x) => String(x).toLowerCase()).slice(0, 500) : [];
+    if (!ids.length) throw new HttpError(400, 'Elige al menos un equipo');
+    let projectId = null;
+    if (b.projectId) {
+      const p = await ownProject(aid, b.projectId);
+      if (p.remote) throw new HttpError(400, 'No puedes mover equipos a un proyecto compartido contigo');
+      projectId = p._id;
+    }
+    let moved = 0;
+    for (const id of ids) {
+      const d = devices.get(id);
+      if (!d || d.accountId !== aid) continue;
+      d.projectId = projectId;
+      markDirty(d);
+      moved++;
+    }
+    res.json({ moved });
+  })
+);
+
+// Dejar de compartir (dueño): quita a una cuenta (o a todas) de los equipos del proyecto.
+app.post(
+  '/api/projects/:id/unshare',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    const p = await ownProject(aid, req.params.id);
+    const who = (req.body || {}).accountId ? String((req.body || {}).accountId) : null;
+    let n = 0;
+    for (const d of ownedProjectDevices(aid, p._id)) {
+      if (!d.sharedWith || !d.sharedWith.length) continue;
+      d.sharedWith = who ? d.sharedWith.filter((a) => a !== who) : [];
+      markDirty(d);
+      n++;
+    }
+    res.json({ ok: true, devices: n });
+  })
+);
+
+/* ---------- Invitaciones por QR ---------- */
+app.post(
+  '/api/projects/:id/share',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    rateLimit(`share:${aid}`, 30, 60 * 60 * 1000);
+    const p = await ownProject(aid, req.params.id);
+    if (p.remote) throw new HttpError(403, 'Solo el dueño puede compartir o transferir este proyecto');
+    const b = req.body || {};
+    const mode = b.mode === 'transfer' ? 'transfer' : 'share';
+    const wanted = new Set((Array.isArray(b.deviceIds) ? b.deviceIds : []).map((x) => String(x).toLowerCase()));
+    const list = ownedProjectDevices(aid, p._id).filter((d) => wanted.has(d._id));
+    if (!list.length) throw new HttpError(400, 'Elige al menos un dispositivo del proyecto');
+    const token = crypto.randomBytes(12).toString('base64url');
+    const now = Date.now();
+    await cols.shares.insertOne({
+      _id: token,
+      accountId: aid,
+      ownerName: req.account.name,
+      projectId: p._id,
+      projectName: p.name,
+      deviceIds: list.map((d) => d._id),
+      mode,
+      used: false,
+      createdAt: new Date(now),
+      expiresAt: new Date(now + SHARE_MINUTES * 60 * 1000),
+    });
+    res.status(201).json({ token, mode, expiresAt: new Date(now + SHARE_MINUTES * 60 * 1000).toISOString(), devices: list.length });
+  })
+);
+
+// Entregar sitio completo por QR
+app.post(
+  '/api/sites/:id/share',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    rateLimit(`sharesite:${aid}`, 30, 60 * 60 * 1000);
+    const site = await cols.sites.findOne({ _id: String(req.params.id), accountId: aid });
+    if (!site) throw new HttpError(404, 'Sucursal no encontrada');
+    const zones = await cols.zones.find({ siteId: site._id, accountId: aid }).toArray();
+    const list = [...devices.values()].filter((d) => d.accountId === aid && d.siteId === site._id);
+    const token = crypto.randomBytes(12).toString('base64url');
+    const now = Date.now();
+    await cols.shares.insertOne({
+      _id: token,
+      accountId: aid,
+      ownerName: req.account.name,
+      type: 'site',
+      siteId: site._id,
+      siteName: site.name,
+      siteKind: site.kind || 'sucursal',
+      mode: 'transfer',
+      deviceIds: list.map((d) => d._id),
+      used: false,
+      createdAt: new Date(now),
+      expiresAt: new Date(now + SHARE_MINUTES * 60 * 1000),
+    });
+    res.status(201).json({ token, mode: 'transfer', type: 'site', expiresAt: new Date(now + SHARE_MINUTES * 60 * 1000).toISOString(), devices: list.length, zones: zones.length });
+  })
+);
+
+async function loadShare(token, aid) {
+  const sh = await cols.shares.findOne({ _id: String(token) });
+  if (!sh || sh.used || sh.expiresAt.getTime() < Date.now()) throw new HttpError(404, 'Este QR ya caducó o ya fue usado. Pide uno nuevo');
+  if (sh.accountId === aid) throw new HttpError(400, 'Este QR es de tu propia cuenta. Debe escanearlo otra cuenta');
+  return sh;
+}
+
+app.get(
+  '/api/share/:token',
+  requireClient,
+  ah(async (req, res) => {
+    rateLimit(`sharelook:${req.account._id}`, 40, 15 * 60 * 1000);
+    const sh = await loadShare(req.params.token, req.account._id);
+    const list = sh.deviceIds.map((id) => devices.get(id)).filter((d) => d && d.accountId === sh.accountId);
+    res.json({
+      type: sh.type || 'project',
+      mode: sh.mode,
+      siteName: sh.siteName || null,
+      projectName: sh.projectName || null,
+      ownerName: sh.ownerName,
+      expiresAt: sh.expiresAt.toISOString(),
+      devices: list.map((d) => ({ id: d._id, name: d.name, type: isSwitchDevice(d) ? 'switch' : 'door' })),
+    });
+  })
+);
+
+app.post(
+  '/api/share/:token/accept',
+  requireClient,
+  ah(async (req, res) => {
+    const aid = req.account._id;
+    rateLimit(`shareacc:${aid}`, 20, 15 * 60 * 1000);
+    await loadShare(req.params.token, aid);
+    // Se marca como usado de forma atómica: solo una cuenta puede aceptar.
+    const got = await cols.shares.findOneAndUpdate({ _id: String(req.params.token), used: false, expiresAt: { $gt: new Date() } }, { $set: { used: true, usedBy: aid, usedAt: new Date() } });
+    const sh = got && (got.value !== undefined ? got.value : got);
+    if (!sh) throw new HttpError(404, 'Este QR ya caducó o ya fue usado. Pide uno nuevo');
+
+    // Transferir sitio completo
+    if (sh.type === 'site') {
+      const site = await cols.sites.findOne({ _id: sh.siteId, accountId: sh.accountId });
+      if (!site) throw new HttpError(409, 'Esa sucursal ya no está disponible');
+
+      const ownerId = sh.accountId;
+      // 1. Mover sucursal y sus zonas a la nueva cuenta
+      await cols.sites.updateOne({ _id: site._id }, { $set: { accountId: aid } });
+      await cols.zones.updateMany({ siteId: site._id, accountId: ownerId }, { $set: { accountId: aid } });
+
+      // 2. Mover todos los dispositivos asignados a la sucursal
+      const siteDevs = [...devices.values()].filter((d) => d.accountId === ownerId && d.siteId === site._id);
+      for (const d of siteDevs) {
+        logEvent(d, 'transfer-site', `${sh.ownerName} → ${req.account.name}`);
+        d.accountId = aid;
+        d.projectId = null;
+        d.sharedWith = [];
+        markDirty(d);
+        wake(d._id);
+      }
+
+      // 3. Limpiar rutinas del dueño anterior para esta sucursal y sus dispositivos
+      await cols.routines.deleteMany({ accountId: ownerId, 'target.id': { $in: [site._id, ...siteDevs.map((d) => d._id)] } });
+
+      return res.json({ ok: true, type: 'site', mode: 'transfer', siteId: site._id, devices: siteDevs.length });
+    }
+
+    const list = sh.deviceIds.map((id) => devices.get(id)).filter((d) => d && d.accountId === sh.accountId);
+    if (!list.length) throw new HttpError(409, 'Esos dispositivos ya no están disponibles');
+
+    if (sh.mode === 'share') {
+      let proj = await cols.projects.findOne({ accountId: aid, 'remote.ownerProjectId': sh.projectId });
+      if (!proj) {
+        proj = { _id: uid(), accountId: aid, name: sh.projectName, createdAt: new Date().toISOString(), remote: { ownerId: sh.accountId, ownerName: sh.ownerName, ownerProjectId: sh.projectId, deviceIds: [] } };
+        await cols.projects.insertOne(proj);
+      }
+      const merged = [...new Set([...(proj.remote.deviceIds || []), ...list.map((d) => d._id)])];
+      await cols.projects.updateOne({ _id: proj._id }, { $set: { 'remote.deviceIds': merged, 'remote.ownerName': sh.ownerName, name: sh.projectName } });
+      for (const d of list) {
+        d.sharedWith = [...new Set([...(d.sharedWith || []), aid])];
+        markDirty(d);
+        logEvent(d, 'share', `${sh.ownerName} → ${req.account.name}`);
+      }
+      return res.json({ ok: true, mode: 'share', projectId: proj._id, devices: list.length });
+    }
+
+    // Transferir proyecto: la propiedad pasa a esta cuenta. Se limpia ubicación, planes y accesos compartidos.
+    const proj = { _id: uid(), accountId: aid, name: sh.projectName, createdAt: new Date().toISOString() };
+    await cols.projects.insertOne(proj);
+    const ownerId = sh.accountId;
+    for (const d of list) {
+      logEvent(d, 'transfer', `${sh.ownerName} → ${req.account.name}`);
+      d.accountId = aid;
+      d.projectId = proj._id;
+      d.siteId = null;
+      d.zoneId = null;
+      d.sharedWith = [];
+      markDirty(d);
+      wake(d._id);
+    }
+    await cols.routines.deleteMany({ accountId: ownerId, 'target.id': { $in: list.map((d) => d._id) } });
+    if (!ownedProjectDevices(ownerId, sh.projectId).length) await cols.projects.deleteOne({ _id: sh.projectId, accountId: ownerId });
+    res.json({ ok: true, mode: 'transfer', projectId: proj._id, devices: list.length });
   })
 );
 
@@ -723,6 +1065,12 @@ function ownDevice(req) {
   if (!d || d.accountId !== req.account._id) throw new HttpError(404, 'No existe un equipo con ese ID');
   return d;
 }
+// Dueño o cuenta con acceso compartido (solo para controlar: abrir / cambiar modo).
+function accessDevice(req) {
+  const d = devices.get(String(req.params.id).toLowerCase());
+  if (!d || (d.accountId !== req.account._id && !sharedWithMe(d, req.account._id))) throw new HttpError(404, 'No existe un equipo con ese ID');
+  return d;
+}
 
 app.patch(
   '/api/devices/:id',
@@ -736,6 +1084,13 @@ app.patch(
       d.modelId = b.modelId ? String(b.modelId) : null;
     }
     if (b.siteId !== undefined || b.zoneId !== undefined) Object.assign(d, await checkPlace(req.account._id, b.siteId, b.zoneId));
+    if (b.projectId !== undefined) {
+      if (b.projectId) {
+        const p = await ownProject(req.account._id, b.projectId);
+        if (p.remote) throw new HttpError(400, 'No puedes mover equipos a un proyecto compartido contigo');
+        d.projectId = p._id;
+      } else d.projectId = null;
+    }
     markDirty(d);
     res.json(toPublic(d));
   })
@@ -745,18 +1100,22 @@ app.post(
   '/api/devices/:id/command',
   requireClient,
   ah(async (req, res) => {
-    const d = ownDevice(req);
-    setMode(d, modeFromBody(req.body || {}), req.user.email);
+    const d = accessDevice(req);
+    const next = modeFromBody(req.body || {});
+    const left = next && next !== modeOf(d) ? cooldownLeft(d) : 0;
+    if (left > 0) throw new HttpError(429, `Espera ${left} s antes de volver a cambiar el apagador`);
+    setMode(d, next, req.user.email);
     res.json(toPublic(d));
   })
 );
 
-// Abrir ahora: el ESP energiza el relé OPEN_SECONDS y vuelve solo a su estado fijo (cerrada o abierta).
+// Abrir ahora: el DALTEC energiza el relé OPEN_SECONDS y vuelve solo a su estado fijo (cerrada o abierta).
 app.post(
   '/api/devices/:id/open',
   requireClient,
   ah(async (req, res) => {
-    const d = ownDevice(req);
+    const d = accessDevice(req);
+    if (isSwitchDevice(d)) throw new HttpError(400, 'Los apagadores no se abren: enciéndelos o apágalos');
     rt(d._id).pendingOpen = OPEN_SECONDS;
     wake(d._id);
     logEvent(d, 'open-panel', req.user.email);
@@ -771,7 +1130,7 @@ app.post(
     const aid = req.account._id;
     const target = await checkTarget(aid, (req.body || {}).target);
     const zones = await cols.zones.find({ accountId: aid }).toArray();
-    const list = devicesFor(aid, target, zones);
+    const list = devicesFor(aid, target, zones).filter((d) => !isSwitchDevice(d)); // "abrir" solo aplica a puertas
     for (const d of list) {
       rt(d._id).pendingOpen = OPEN_SECONDS;
       wake(d._id);
@@ -791,9 +1150,11 @@ app.post(
     if (!MODES.includes(mode)) throw new HttpError(400, 'Modo inválido (normal, open o closed)');
     const target = await checkTarget(aid, (req.body || {}).target);
     const zones = await cols.zones.find({ accountId: aid }).toArray();
-    const list = devicesFor(aid, target, zones);
-    for (const d of list) setMode(d, mode, req.user.email);
-    res.json({ affected: list.length, mode });
+    const kind = (req.body || {}).kind; // 'door' | 'switch' (opcional): evita mezclar puertas con apagadores
+    const list = devicesFor(aid, target, zones).filter((d) => !kind || (kind === 'switch') === isSwitchDevice(d));
+    const ready = list.filter((d) => !(mode !== modeOf(d) && cooldownLeft(d) > 0)); // los apagadores en espera se omiten
+    for (const d of ready) setMode(d, mode, req.user.email);
+    res.json({ affected: ready.length, skipped: list.length - ready.length, mode });
   })
 );
 
@@ -1182,6 +1543,25 @@ app.post(
     d.lastSeen = new Date().toISOString();
     if (Number.isFinite(body.rssi)) d.rssi = body.rssi;
     if (typeof body.fw === 'string') d.fw = body.fw.slice(0, 20);
+    if (typeof body.isMaster === 'boolean') {
+      if (d.isMaster !== body.isMaster) { d.isMaster = body.isMaster; changed = true; }
+    }
+    if (typeof body.role === 'string') {
+      const r = body.role.slice(0, 20);
+      if (d.role !== r) { d.role = r; changed = true; }
+      if (typeof body.isMaster !== 'boolean') {
+        const m = (r === 'master');
+        if (d.isMaster !== m) { d.isMaster = m; changed = true; }
+      }
+    }
+    if (typeof body.masterId === 'string') {
+      const mid = body.masterId.slice(0, 40);
+      if (d.masterId !== mid) { d.masterId = mid; changed = true; }
+    }
+    if (Number.isFinite(body.slavesCount)) {
+      const sc = Math.max(0, Math.floor(body.slavesCount));
+      if (d.slavesCount !== sc) { d.slavesCount = sc; changed = true; }
+    }
 
     if (typeof body.ssidHex === 'string' && /^([0-9a-f]{2}){0,32}$/i.test(body.ssidHex)) {
       const ssid = Buffer.from(body.ssidHex, 'hex').toString('utf8');
@@ -1204,6 +1584,45 @@ app.post(
       }
     }
 
+    // Rutinas para ejecución local / offline en el propio equipo
+    let devSched = [];
+    let devTzOffset = -21600;
+    if (d.accountId && cols.routines) {
+      try {
+        const acc = await cols.accounts.findOne({ _id: d.accountId });
+        const tz = (acc && acc.timezone) || DEFAULT_TZ;
+        const nowD = new Date();
+        const dStr = nowD.toLocaleString('en-US', { timeZone: tz });
+        const tzDate = new Date(dStr);
+        devTzOffset = Math.round((tzDate.getTime() - nowD.getTime()) / 1000);
+
+        const [zones, allRoutines] = await Promise.all([
+          cols.zones.find({ accountId: d.accountId }).toArray(),
+          cols.routines.find({ accountId: d.accountId, enabled: true }).toArray()
+        ]);
+
+        for (const r of allRoutines) {
+          const devs = devicesFor(d.accountId, r.target, zones);
+          if (devs.some((x) => x._id === d._id)) {
+            let mask = 0;
+            for (const day of (r.days || [])) mask |= (1 << day);
+            const toMin = (t) => {
+              if (!t) return -1;
+              const [h, m] = t.split(':').map(Number);
+              return h * 60 + m;
+            };
+            devSched.push({
+              d: mask,
+              on: toMin(r.onTime),
+              off: toMin(r.offTime),
+            });
+          }
+        }
+      } catch (err) {
+        console.error('[sched] Error calculando rutinas de equipo:', err.message);
+      }
+    }
+
     const r = rt(id);
     if (changed || Date.now() - r.lastSaved > 60000) {
       r.lastSaved = Date.now();
@@ -1219,6 +1638,8 @@ app.post(
         lp: 1,
         serverTime: new Date().toISOString(),
         serverEpoch: Math.floor(Date.now() / 1000),
+        tzOffset: devTzOffset,
+        sched: devSched,
         usersVer: currentPeopleVer,
         usersSync: needUsersSync ? 1 : 0,
       };
@@ -1363,6 +1784,317 @@ app.post(
   })
 );
 
+/* ============================================================
+ *  INTEGRACIÓN CON ASISTENTES DE VOZ  —  Alexa & Google Home
+ *  ──────────────────────────────────────────────────────────
+ *  Flujo:
+ *    1. El usuario abre la skill/acción en su app y hace "vincular cuenta".
+ *    2. Se redirige a /oauth/authorize → pantalla de login de DALTEC.
+ *    3. Tras iniciar sesión el servidor redirige con un code al asistente.
+ *    4. El asistente canjea el code por access_token en /oauth/token.
+ *    5. Las órdenes de voz llegan a /alexa/smart-home o /google/fulfillment.
+ *
+ *  Variables de entorno necesarias en Render:
+ *    ALEXA_CLIENT_ID      (el que tú eliges, p.ej. "daltec-alexa")
+ *    ALEXA_CLIENT_SECRET  (cadena larga aleatoria)
+ *    GOOGLE_CLIENT_ID     (el que tú eliges, p.ej. "daltec-google")
+ *    GOOGLE_CLIENT_SECRET (cadena larga aleatoria)
+ *    APP_URL              (p.ej. https://daltec.onrender.com)
+ * ============================================================ */
+
+const ALEXA_CLIENT_ID     = process.env.ALEXA_CLIENT_ID     || 'daltec-alexa';
+const ALEXA_CLIENT_SECRET = process.env.ALEXA_CLIENT_SECRET || '';
+const GOOGLE_CLIENT_ID    = process.env.GOOGLE_CLIENT_ID    || 'daltec-google';
+const GOOGLE_CLIENT_SECRET= process.env.GOOGLE_CLIENT_SECRET|| '';
+const APP_URL = (process.env.APP_URL || 'https://daltec.onrender.com').replace(/\/$/, '');
+
+// ── Tokens OAuth en memoria ──────────────────────────────────────────────────
+// Map: token → { userId, accountId, expiresAt, isRefresh? }
+const oauthTokens = new Map();
+// Map: code  → { userId, accountId, clientId, redirectUri, expiresAt }
+const oauthCodes  = new Map();
+// Limpiar periódicamente tokens expirados
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of oauthTokens) if (now > v.expiresAt) oauthTokens.delete(k);
+  for (const [k, v] of oauthCodes)  if (now > v.expiresAt) oauthCodes.delete(k);
+}, 5 * 60 * 1000).unref();
+
+function genOauthToken() { return crypto.randomBytes(32).toString('hex'); }
+
+function resolveOauthUser(token) {
+  const data = oauthTokens.get(token);
+  if (!data || Date.now() > data.expiresAt || data.isRefresh) return null;
+  return data;
+}
+
+// ── Helpers HTML ─────────────────────────────────────────────────────────────
+function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+
+// ── GET /oauth/authorize ─────────────────────────────────────────────────────
+app.get('/oauth/authorize', (req, res) => {
+  const { client_id, redirect_uri, state, response_type } = req.query;
+  const validClients = new Set([ALEXA_CLIENT_ID, GOOGLE_CLIENT_ID].filter(Boolean));
+  if (!validClients.has(client_id) || response_type !== 'code')
+    return res.status(400).send('<h2>Parámetros OAuth inválidos</h2>');
+  const platform = client_id === GOOGLE_CLIENT_ID ? 'Google Home' : 'Amazon Alexa';
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DALTEC – Vincular cuenta</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:1rem}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2rem;width:100%;max-width:380px;text-align:center}
+  h1{font-size:1.4rem;margin:.5rem 0 .3rem}
+  p{color:#8b949e;font-size:.9rem;margin-bottom:1.5rem}
+  label{display:block;text-align:left;font-size:.85rem;color:#8b949e;margin-bottom:.25rem}
+  input{width:100%;padding:.6rem .8rem;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;font-size:1rem;margin-bottom:1rem;outline:none}
+  input:focus{border-color:#d71920}
+  .btn{width:100%;padding:.75rem;border-radius:8px;border:none;background:#d71920;color:#fff;font-size:1rem;font-weight:600;cursor:pointer}
+  .btn:hover{background:#b01219}
+  .err{color:#f85149;font-size:.85rem;margin-bottom:.75rem}
+</style>
+</head>
+<body>
+<div class="card">
+  <div style="font-size:2.5rem">🔌</div>
+  <h1>DALTEC</h1>
+  <p>Inicia sesión para vincular tu cuenta con <strong>${esc(platform)}</strong></p>
+  ${req.query.err ? `<p class="err">Correo o contraseña incorrectos</p>` : ''}
+  <form method="POST" action="/oauth/authorize">
+    <input type="hidden" name="client_id"    value="${esc(client_id)}">
+    <input type="hidden" name="redirect_uri" value="${esc(redirect_uri)}">
+    <input type="hidden" name="state"        value="${esc(state || '')}">
+    <label>Correo electrónico</label>
+    <input type="email"    name="email"    required autofocus placeholder="tu@correo.com">
+    <label>Contraseña</label>
+    <input type="password" name="password" required placeholder="••••••••">
+    <button class="btn" type="submit">Autorizar acceso</button>
+  </form>
+</div>
+</body></html>`);
+});
+
+// ── POST /oauth/authorize  (procesa el login y redirige con code) ─────────────
+app.post('/oauth/authorize', express.urlencoded({ extended: false }), ah(async (req, res) => {
+  const { client_id, redirect_uri, state, email, password } = req.body || {};
+  const validClients = new Set([ALEXA_CLIENT_ID, GOOGLE_CLIENT_ID].filter(Boolean));
+  if (!validClients.has(client_id)) return res.status(400).send('Cliente OAuth inválido');
+
+  const user = cols.users && await cols.users.findOne({ email: String(email || '').trim().toLowerCase() });
+  const ok   = user && (await bcrypt.compare(String(password || ''), user.passHash));
+  if (!ok) {
+    // Volver a la página de login con bandera de error
+    const retryUrl = new URL(`${APP_URL}/oauth/authorize`);
+    retryUrl.searchParams.set('response_type', 'code');
+    retryUrl.searchParams.set('client_id', client_id);
+    retryUrl.searchParams.set('redirect_uri', redirect_uri);
+    if (state) retryUrl.searchParams.set('state', state);
+    retryUrl.searchParams.set('err', '1');
+    return res.redirect(retryUrl.toString());
+  }
+
+  const code = genOauthToken();
+  oauthCodes.set(code, { userId: user._id, accountId: user.accountId, clientId: client_id, redirectUri: redirect_uri, expiresAt: Date.now() + 5 * 60 * 1000 });
+  const dest = new URL(redirect_uri);
+  dest.searchParams.set('code', code);
+  if (state) dest.searchParams.set('state', state);
+  res.redirect(dest.toString());
+}));
+
+// ── POST /oauth/token  (canjea code ó refresh_token por access_token) ─────────
+app.post('/oauth/token', express.urlencoded({ extended: false }), ah(async (req, res) => {
+  // Alexa puede mandar los params en query string o en el cuerpo urlencoded
+  const b = Object.assign({}, req.query, req.body);
+  const { grant_type, code, refresh_token, client_id, client_secret } = b;
+
+  const validClient =
+    (client_id === ALEXA_CLIENT_ID  && ALEXA_CLIENT_SECRET  && client_secret === ALEXA_CLIENT_SECRET) ||
+    (client_id === GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && client_secret === GOOGLE_CLIENT_SECRET);
+  if (!validClient) return res.status(401).json({ error: 'invalid_client' });
+
+  if (grant_type === 'authorization_code') {
+    const data = oauthCodes.get(code);
+    if (!data || Date.now() > data.expiresAt || data.clientId !== client_id)
+      return res.status(400).json({ error: 'invalid_grant' });
+    oauthCodes.delete(code);
+    const access  = genOauthToken();
+    const refresh = genOauthToken();
+    oauthTokens.set(access,  { userId: data.userId, accountId: data.accountId, expiresAt: Date.now() + 3600 * 1000 });
+    oauthTokens.set(refresh, { userId: data.userId, accountId: data.accountId, expiresAt: Date.now() + 30 * 24 * 3600 * 1000, isRefresh: true });
+    return res.json({ access_token: access, token_type: 'Bearer', expires_in: 3600, refresh_token: refresh });
+  }
+
+  if (grant_type === 'refresh_token') {
+    const data = oauthTokens.get(refresh_token);
+    if (!data || !data.isRefresh || Date.now() > data.expiresAt)
+      return res.status(400).json({ error: 'invalid_grant' });
+    const access = genOauthToken();
+    oauthTokens.set(access, { userId: data.userId, accountId: data.accountId, expiresAt: Date.now() + 3600 * 1000 });
+    return res.json({ access_token: access, token_type: 'Bearer', expires_in: 3600, refresh_token });
+  }
+
+  res.status(400).json({ error: 'unsupported_grant_type' });
+}));
+
+// ── Alexa Smart Home Skill  POST /alexa/smart-home ────────────────────────────
+app.post('/alexa/smart-home', ah(async (req, res) => {
+  const event     = req.body || {};
+  const directive = event.directive || {};
+  const header    = directive.header || {};
+  const ns        = header.namespace || '';
+  const name      = header.name     || '';
+  const corrToken = header.correlationToken;
+  const token     = directive.endpoint?.scope?.token || directive.payload?.scope?.token || '';
+
+  function alexaResp(respNs, respName, props, endpointId, extraPayload = {}) {
+    return {
+      event: {
+        header: { namespace: respNs, name: respName, messageId: crypto.randomUUID(), correlationToken: corrToken, payloadVersion: '3' },
+        endpoint: endpointId ? { endpointId, scope: { type: 'BearerToken', token } } : {},
+        payload: extraPayload,
+      },
+      context: { properties: props || [] },
+    };
+  }
+  function alexaErr(type, message) {
+    return { event: { header: { namespace: 'Alexa', name: 'ErrorResponse', messageId: crypto.randomUUID(), correlationToken: corrToken, payloadVersion: '3' }, payload: { type, message } } };
+  }
+  function powerProp(state) {
+    return [{ namespace: 'Alexa.PowerController', name: 'powerState', value: state, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 }];
+  }
+
+  // Discovery usa el token del scope del payload
+  if (ns === 'Alexa.Discovery' && name === 'Discover') {
+    const td = resolveOauthUser(token);
+    if (!td) return res.json(alexaErr('INVALID_AUTHORIZATION_CREDENTIAL', 'Token inválido o expirado'));
+    const endpoints = [...devices.values()]
+      .filter(d => d.accountId === td.accountId)
+      .map(d => ({
+        endpointId: d._id,
+        manufacturerName: 'DALTEC',
+        friendlyName: d.name || d._id,
+        description: isSwitchDevice(d) ? 'Apagador inteligente DALTEC' : 'Control de acceso DALTEC',
+        displayCategories: isSwitchDevice(d) ? ['SWITCH', 'LIGHT'] : ['SMARTLOCK'],
+        capabilities: [
+          { type: 'AlexaInterface', interface: 'Alexa', version: '3' },
+          { type: 'AlexaInterface', interface: 'Alexa.PowerController', version: '3',
+            properties: { supported: [{ name: 'powerState' }], proactivelyReported: false, retrievable: true } },
+          { type: 'AlexaInterface', interface: 'Alexa.EndpointHealth', version: '3',
+            properties: { supported: [{ name: 'connectivity' }], proactivelyReported: false, retrievable: true } },
+        ],
+      }));
+    return res.json({ event: { header: { namespace: 'Alexa.Discovery', name: 'Discover.Response', messageId: crypto.randomUUID(), payloadVersion: '3' }, payload: { endpoints } } });
+  }
+
+  // Resto de directivas: necesitan token válido y endpointId
+  const td = resolveOauthUser(token);
+  if (!td) return res.json(alexaErr('INVALID_AUTHORIZATION_CREDENTIAL', 'Token inválido o expirado'));
+
+  const endpointId = (directive.endpoint?.endpointId || '').toLowerCase();
+  const d = endpointId ? devices.get(endpointId) : null;
+  if (!d || d.accountId !== td.accountId)
+    return res.json(alexaErr('NO_SUCH_ENDPOINT', 'Equipo no encontrado en tu cuenta'));
+
+  if (ns === 'Alexa.PowerController') {
+    const targetMode = name === 'TurnOn' ? 'open' : 'normal';
+    const cl = cooldownLeft(d);
+    if (cl > 0 && targetMode !== modeOf(d))
+      return res.json(alexaErr('THROTTLING_EXCEPTION', `Espera ${cl} segundos antes de volver a cambiar`));
+    setMode(d, targetMode, 'alexa');
+    return res.json(alexaResp('Alexa', 'Response', powerProp(d.desiredState), d._id));
+  }
+
+  if (ns === 'Alexa' && name === 'ReportState') {
+    return res.json(alexaResp('Alexa', 'StateReport', [
+      ...powerProp(d.desiredState),
+      { namespace: 'Alexa.EndpointHealth', name: 'connectivity',
+        value: { value: isOnline(d) ? 'OK' : 'UNREACHABLE' },
+        timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 },
+    ], d._id));
+  }
+
+  res.json(alexaErr('INVALID_DIRECTIVE', `Directiva no soportada: ${ns}/${name}`));
+}));
+
+// ── Google Home Smart Home Action  POST /google/fulfillment ──────────────────
+app.post('/google/fulfillment', ah(async (req, res) => {
+  const h  = req.get('authorization') || '';
+  const td = resolveOauthUser(h.startsWith('Bearer ') ? h.slice(7) : '');
+  if (!td) return res.status(401).json({ requestId: (req.body || {}).requestId, payload: { errorCode: 'authFailure' } });
+
+  const accountId = td.accountId;
+  const inputs    = (req.body || {}).inputs || [];
+  const requestId = (req.body || {}).requestId || crypto.randomUUID();
+
+  const outputs = await Promise.all(inputs.map(async ({ intent, payload: p }) => {
+    // ── SYNC ──────────────────────────────────────────────────────────────────
+    if (intent === 'action.devices.SYNC') {
+      return {
+        agentUserId: accountId,
+        devices: [...devices.values()].filter(d => d.accountId === accountId).map(d => ({
+          id: d._id,
+          type: isSwitchDevice(d) ? 'action.devices.types.SWITCH' : 'action.devices.types.OUTLET',
+          traits: ['action.devices.traits.OnOff'],
+          name: { name: d.name || d._id, defaultNames: [d._id], nicknames: [d.name || d._id] },
+          willReportState: false,
+          attributes: {},
+          deviceInfo: { manufacturer: 'DALTEC', model: d.model || 'DAL-SW-1G', hwVersion: '1.0', swVersion: d.fw || '1.0' },
+          roomHint: d.siteId || undefined,
+        })),
+      };
+    }
+
+    // ── QUERY ─────────────────────────────────────────────────────────────────
+    if (intent === 'action.devices.QUERY') {
+      const states = {};
+      for (const { id } of (p?.devices || [])) {
+        const d = devices.get(String(id).toLowerCase());
+        if (!d || d.accountId !== accountId) { states[id] = { online: false, status: 'ERROR', errorCode: 'deviceNotFound' }; continue; }
+        states[d._id] = { online: isOnline(d), on: d.desiredState === 'ON', status: 'SUCCESS' };
+      }
+      return { devices: states };
+    }
+
+    // ── EXECUTE ───────────────────────────────────────────────────────────────
+    if (intent === 'action.devices.EXECUTE') {
+      const commands = [];
+      for (const cmd of (p?.commands || [])) {
+        for (const execution of (cmd.execution || [])) {
+          const successIds = [], failIds = [], offlineIds = [];
+          for (const { id } of (cmd.devices || [])) {
+            const d = devices.get(String(id).toLowerCase());
+            if (!d || d.accountId !== accountId) { failIds.push(id); continue; }
+            if (!isOnline(d)) { offlineIds.push(d._id); continue; }
+            if (execution.command === 'action.devices.commands.OnOff') {
+              const target = execution.params?.on ? 'open' : 'normal';
+              if (cooldownLeft(d) > 0 && target !== modeOf(d)) { failIds.push(d._id); continue; }
+              setMode(d, target, 'google');
+              successIds.push(d._id);
+            } else { failIds.push(d._id); }
+          }
+          if (successIds.length) commands.push({ ids: successIds, status: 'SUCCESS', states: { on: execution.params?.on } });
+          if (offlineIds.length) commands.push({ ids: offlineIds, status: 'OFFLINE' });
+          if (failIds.length)   commands.push({ ids: failIds,    status: 'ERROR', errorCode: 'commandInsertionError' });
+        }
+      }
+      return { commands };
+    }
+
+    // ── DISCONNECT ────────────────────────────────────────────────────────────
+    if (intent === 'action.devices.DISCONNECT') {
+      for (const [t, v] of oauthTokens) if (v.accountId === accountId) oauthTokens.delete(t);
+      return {};
+    }
+
+    return { errorCode: 'notSupported' };
+  }));
+
+  // Google espera el payload del primer intent directamente cuando hay un solo input
+  res.json({ requestId, payload: outputs.length === 1 ? outputs[0] : outputs });
+}));
+
 app.use((req, res) => res.status(404).json({ error: 'Ruta no encontrada' }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
@@ -1404,6 +2136,8 @@ async function main() {
     models: db.collection('models'),
     events: db.collection('events'),
     people: db.collection('people'),
+    projects: db.collection('projects'),
+    shares: db.collection('shares'),
   };
   await Promise.all([
     cols.accounts.createIndex({ slug: 1 }, { unique: true }),
@@ -1416,6 +2150,8 @@ async function main() {
     cols.events.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 180 }), // el registro se conserva 180 días
     cols.people.createIndex({ accountId: 1 }),
     cols.people.createIndex({ accountId: 1, 'cards': 1 }),
+    cols.projects.createIndex({ accountId: 1 }),
+    cols.shares.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 3600 }), // las invitaciones caducadas se limpian solas
   ]);
 
   // Administrador inicial (solo si no existe ninguno).
